@@ -48,6 +48,15 @@ the slicer's estimate with the rate so far.
 
 Right click a print in the history to queue it again.
 
+## Bed
+
+"bed" on a card shows the printer's mesh as a map, back at the top and front
+at the bottom, with its range, whether leveling is on and the fade height. It
+is read with `M420 V` when the printer connects. "probe" homes and runs `G29`,
+heating the bed first if you pick a temperature, since a bed moves as it heats.
+It is only offered on an idle printer whose bed is marked clear. "save" sends
+`M500`, which stores every setting, so it asks first.
+
 ## Camera
 
 Give a printer a camera URL: a JPEG snapshot that is polled once a second, or
