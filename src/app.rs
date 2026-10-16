@@ -1296,27 +1296,33 @@ fn heater_line(ui: &mut Ui, status: &crate::printer::Status, samples: &HashMap<S
         return;
     }
     ui.add_space(6.0);
-    let n = status.heaters.len();
-    ui.horizontal(|ui| {
-        let gap = 8.0;
-        let w = (ui.available_width() - gap * (n as f32 - 1.0)) / n as f32;
-        ui.spacing_mut().item_spacing.x = gap;
-        for h in &status.heaters {
-            let points = samples.get(&h.name).map(Vec::as_slice).unwrap_or_default();
-            let hi = points.iter().copied().fold(h.target.max(50.0), f32::max) * 1.6;
-            let mut t = Trace::new(points).size(Vec2::new(w, 38.0)).range(0.0, hi);
-            if h.target > 0.0 {
-                t = t.rule(h.target);
-            }
-            let rect = ui.add(t).rect;
-            let mut line = Line::new().legend(&h.name).measured(format!("{:.1} °C", h.actual));
-            if h.target > 0.0 {
-                line = line.note(" / ").set(format!("{:.0}", h.target));
-            }
-            let galley = ui.painter().layout_job(line.job());
-            ui.painter_at(rect).galley(rect.left_top() + Vec2::new(6.0, 3.0), galley, VALUE);
+    let n = status.heaters.len() as f32;
+    let gap = 8.0;
+    let (row, _) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 44.0), Sense::hover());
+    let w = (row.width() - gap * (n - 1.0)) / n;
+    for (k, h) in status.heaters.iter().enumerate() {
+        let cell = Rect::from_min_size(
+            egui::pos2(row.left() + k as f32 * (w + gap), row.top()),
+            Vec2::new(w, row.height()),
+        );
+        let points = samples.get(&h.name).map(Vec::as_slice).unwrap_or_default();
+        let top = points.iter().copied().fold(h.target.max(50.0), f32::max) * 1.05;
+        let band = 18.0;
+        ui.painter().rect_filled(cell, 1.0, WELL);
+        ui.painter().rect_stroke(cell, 1.0, Stroke::new(1.0, ETCH), egui::StrokeKind::Inside);
+        let plot = Rect::from_min_max(egui::pos2(cell.left(), cell.top() + band), cell.max);
+        let mut t = Trace::new(points).size(plot.size()).range(0.0, top);
+        if h.target > 0.0 {
+            t = t.rule(h.target);
         }
-    });
+        ui.put(plot, t);
+        let mut line = Line::new().legend(&h.name).measured(format!("{:.1} °C", h.actual));
+        if h.target > 0.0 {
+            line = line.note(" / ").set(format!("{:.0}", h.target));
+        }
+        let galley = ui.painter().layout_job(line.job());
+        ui.painter_at(cell).galley(cell.left_top() + Vec2::new(6.0, 3.0), galley, VALUE);
+    }
 }
 
 fn probe_gcode(bed: u32, hotend_was: f32, bed_was: f32) -> String {
