@@ -14,7 +14,9 @@ All notable changes to printfarm are listed here. The format follows
   room.
 
 ### Added
-- The bed mesh and whether leveling is on are read from the printer.
+- Probe the bed from the card, optionally heated first, and see the mesh as a map with its range,
+  leveling on or off, fade height and when it was probed. Leveling can be turned on and off and
+  the mesh saved to the printer.
 
 ## [0.1.0] - 2026-10-16
 

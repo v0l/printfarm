@@ -261,8 +261,17 @@ impl Marlin {
                 return;
             }
             if let Some(rows) = self.grid.take().and_then(GridReader::finish) {
-                let probed = self.status.activity == activity("G29");
-                self.status.leveling.mesh = Some(Mesh { rows, read: SystemTime::now(), probed });
+                let before =
+                    self.status.leveling.mesh.take().filter(|m| m.rows == rows && m.probed);
+                let mesh = match before {
+                    Some(m) if self.status.activity != activity("G29") => m,
+                    _ => Mesh {
+                        rows,
+                        read: SystemTime::now(),
+                        probed: self.status.activity == activity("G29"),
+                    },
+                };
+                self.status.leveling.mesh = Some(mesh);
             }
         }
         if let Some(keep) = grid_title(line) {

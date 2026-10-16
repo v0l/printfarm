@@ -338,3 +338,24 @@ fn console_commands_are_sent_and_answered() {
     assert_eq!(seen.commands[i + 1], "M114");
     assert!(ev.iter().any(|e| matches!(e, Event::Console(Dir::Sent, c) if c == "M503")));
 }
+
+#[test]
+fn probing_reads_the_mesh_and_turns_leveling_on() {
+    let (mut m, _b) = connected(Script::default());
+    assert_eq!(m.status().leveling.enabled, Some(false));
+    assert!(m.status().leveling.mesh.is_none());
+    m.gcode("G28\nG29\nM420 V").unwrap();
+    let mut ev = Vec::new();
+    until(&mut m, &mut ev, "the mesh", |m, _| m.settled() && m.status().leveling.mesh.is_some());
+    let l = &m.status().leveling;
+    let mesh = l.mesh.as_ref().unwrap();
+    assert!(mesh.probed);
+    assert_eq!((mesh.columns(), mesh.rows.len()), (5, 5));
+    assert_eq!(mesh.rows[0][0], Some(0.485));
+    assert_eq!(mesh.rows[4][4], Some(-0.287));
+    assert_eq!(l.enabled, Some(true));
+    assert_eq!(l.fade, Some(10.0));
+    m.gcode("M420 S0").unwrap();
+    until(&mut m, &mut ev, "leveling off", |m, _| m.status().leveling.enabled == Some(false));
+    assert!(m.status().activity.is_none());
+}

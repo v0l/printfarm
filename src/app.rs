@@ -5,7 +5,7 @@ use crate::gcode;
 use crate::printer::marlin::{self, BAUDS, Detected, PortInfo};
 use crate::printer::{Dir, Event, Outcome, State};
 use crate::station::{Control, Station, Wake};
-use egui::{Color32, FontId, Id, Sense, Stroke, TextureHandle, TextureOptions, Ui, Vec2};
+use egui::{Color32, FontId, Id, Rect, Sense, Stroke, TextureHandle, TextureOptions, Ui, Vec2};
 use egui_bench::prelude::*;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -40,6 +40,9 @@ enum Act {
     Drop(u64),
     Assign(u64, Option<String>),
     Again(usize),
+    Mesh(usize),
+    Probe(usize),
+    SaveMesh(usize),
 }
 
 struct Editor {
@@ -100,6 +103,9 @@ pub struct App {
     cancelling: Option<usize>,
     closing: bool,
     big_camera: Option<String>,
+    mesh: Option<String>,
+    probing: Option<(usize, u32)>,
+    saving_mesh: Option<usize>,
     notice: Option<(bool, String)>,
 }
 
@@ -144,6 +150,9 @@ impl App {
             cancelling: None,
             closing: false,
             big_camera: None,
+            mesh: None,
+            probing: None,
+            saving_mesh: None,
             notice,
         };
         app.restart_stations();
@@ -296,6 +305,9 @@ impl App {
                 }
                 Act::Remove(i) => self.removing = Some(i),
                 Act::Console(i) => self.console = Some(self.config.printers[i].id.clone()),
+                Act::Mesh(i) => self.mesh = Some(self.config.printers[i].id.clone()),
+                Act::Probe(i) => self.probing = Some((i, 0)),
+                Act::SaveMesh(i) => self.saving_mesh = Some(i),
                 Act::Camera(i) => self.big_camera = Some(self.config.printers[i].id.clone()),
                 Act::Pick(printer) => {
                     let dir = self
@@ -873,6 +885,65 @@ impl App {
                 self.cancelling = None;
             }
         }
+        if let Some((i, heat)) = self.probing {
+            let name = self.config.printers[i].name.clone();
+            let mut pick = heat;
+            let mut go = false;
+            let m = egui::Modal::new(Id::new("probe")).show(ctx, |ui| {
+                ui.set_width(400.0);
+                modal_title(ui, &format!("Probe the bed on {name}?"));
+                note(ui, "It homes and then touches the bed at every mesh point. Make sure the bed is empty.", LEGEND);
+                ui.add_space(6.0);
+                row_help(ui, "bed", "A bed moves as it heats, so probe it at the temperature you print at.", |ui| {
+                    choice(ui, "probe heat", &mut pick, [
+                        (0, "cold".to_string()),
+                        (60, "60 °C, PLA".to_string()),
+                        (65, "65 °C".to_string()),
+                        (80, "80 °C, PETG".to_string()),
+                    ]);
+                });
+                footer(ui, |ui| {
+                    if ui.add(Key::new("probe").solid(READOUT).min_width(100.0)).clicked() {
+                        go = true;
+                    }
+                    if ui.add(Key::new("cancel").outline(VALUE).min_width(100.0)).clicked() {
+                        self.probing = None;
+                    }
+                });
+            });
+            if go {
+                self.stations[i].send(Control::Gcode(probe_gcode(pick)));
+                self.probing = None;
+            } else if m.should_close() {
+                self.probing = None;
+            } else if self.probing.is_some() {
+                self.probing = Some((i, pick));
+            }
+        }
+        if let Some(i) = self.saving_mesh {
+            let name = self.config.printers[i].name.clone();
+            let m = egui::Modal::new(Id::new("save mesh")).show(ctx, |ui| {
+                ui.set_width(400.0);
+                modal_title(ui, &format!("Save the mesh on {name}?"));
+                note(
+                    ui,
+                    "M500 writes every setting the printer holds to its EEPROM, not only the mesh, and they load at every power on.",
+                    WARN,
+                );
+                footer(ui, |ui| {
+                    if ui.add(Key::new("save").solid(WARN).min_width(100.0)).clicked() {
+                        self.stations[i].send(Control::Gcode("M500".into()));
+                        self.saving_mesh = None;
+                    }
+                    if ui.add(Key::new("cancel").outline(VALUE).min_width(100.0)).clicked() {
+                        self.saving_mesh = None;
+                    }
+                });
+            });
+            if m.should_close() {
+                self.saving_mesh = None;
+            }
+        }
         if self.closing {
             let sending = self.sending();
             let m = egui::Modal::new(Id::new("closing")).show(ctx, |ui| {
@@ -959,6 +1030,106 @@ impl App {
             });
         if !open {
             self.console = None;
+        }
+    }
+
+    fn mesh_window(&mut self, ctx: &egui::Context, acts: &mut Vec<Act>) {
+        let Some(id) = self.mesh.clone() else { return };
+        let Some(i) = self.config.printers.iter().position(|p| p.id == id) else {
+            self.mesh = None;
+            return;
+        };
+        let status = self.stations[i].status();
+        let unclear = self.queue.unclear.contains(&id);
+        let mut open = true;
+        egui::Window::new(format!("{} bed", self.config.printers[i].name))
+            .id(Id::new(("mesh", &id)))
+            .open(&mut open)
+            .default_width(460.0)
+            .resizable(false)
+            .show(ctx, |ui| {
+                let l = &status.leveling;
+                let span = l.mesh.as_ref().and_then(|m| m.span());
+                let enabled = match l.enabled {
+                    Some(true) => ("on".to_string(), OK),
+                    Some(false) => ("off".to_string(), WARN),
+                    None => ("-".to_string(), LEGEND),
+                };
+                readouts(
+                    ui,
+                    &[
+                        ("leveling", enabled.0, enabled.1),
+                        (
+                            "range",
+                            span.map(|(lo, hi)| format!("{:.3} mm", hi - lo)).unwrap_or("-".into()),
+                            TRACE,
+                        ),
+                        (
+                            "lowest",
+                            span.map(|(lo, _)| format!("{lo:+.3}")).unwrap_or("-".into()),
+                            TRACE,
+                        ),
+                        (
+                            "highest",
+                            span.map(|(_, hi)| format!("{hi:+.3}")).unwrap_or("-".into()),
+                            TRACE,
+                        ),
+                        ("fade", l.fade.map(|f| format!("{f:.0} mm")).unwrap_or("-".into()), VALUE),
+                    ],
+                );
+                match &l.mesh {
+                    Some(m) => {
+                        mesh_map(ui, m);
+                        let when = when(farm::unix(m.read));
+                        let what = if m.probed { "probed" } else { "stored on the printer, read" };
+                        Line::new()
+                            .note(format!("{what} {when}. Positive is where the bed is high."))
+                            .size(10.5)
+                            .wrapped(ui);
+                    }
+                    None => note(
+                        ui,
+                        "The printer has not reported a mesh. Probe the bed to make one.",
+                        LEGEND,
+                    ),
+                }
+                if let Some(a) = status.activity {
+                    Line::new().legend("now").value(a).show(ui);
+                }
+                ui.add_space(8.0);
+                let idle = status.state() == State::Idle && status.activity.is_none();
+                ui.horizontal(|ui| {
+                    if ui.add(Key::new("probe").solid(READOUT).enabled(idle && !unclear)).clicked()
+                    {
+                        acts.push(Act::Probe(i));
+                    }
+                    let (label, cmd) = if l.enabled == Some(true) {
+                        ("leveling off", "M420 S0")
+                    } else {
+                        ("leveling on", "M420 S1")
+                    };
+                    if ui
+                        .add(Key::new(label).outline(VALUE).enabled(l.mesh.is_some() && idle))
+                        .clicked()
+                    {
+                        acts.push(Act::Gcode(i, cmd.into()));
+                    }
+                    if ui.add(Key::new("read again").outline(VALUE).enabled(idle)).clicked() {
+                        acts.push(Act::Gcode(i, "M420 V".into()));
+                    }
+                    if ui
+                        .add(Key::new("save").outline(WARN).enabled(l.mesh.is_some() && idle))
+                        .clicked()
+                    {
+                        acts.push(Act::SaveMesh(i));
+                    }
+                });
+                if unclear {
+                    note(ui, "Clear the bed and mark it clear on the card before probing.", WARN);
+                }
+            });
+        if !open {
+            self.mesh = None;
         }
     }
 
@@ -1074,6 +1245,7 @@ impl eframe::App for App {
         });
         self.console_window(&ctx, &mut acts);
         self.big_camera_window(&ctx);
+        self.mesh_window(&ctx, &mut acts);
         self.apply(acts);
         self.editor(&ctx);
         self.confirmations(&ctx);
@@ -1149,6 +1321,78 @@ fn heater_line(ui: &mut Ui, status: &crate::printer::Status, samples: &HashMap<S
             ui.add(t).on_hover_text(&h.name);
         }
     });
+}
+
+fn probe_gcode(bed: u32) -> String {
+    let mut g = Vec::new();
+    if bed > 0 {
+        g.push(format!("M190 S{bed}"));
+    }
+    g.extend(["G28".to_string(), "G29".to_string(), "M420 V".to_string()]);
+    if bed > 0 {
+        g.push("M140 S0".into());
+    }
+    g.join("\n")
+}
+
+fn leveling_summary(l: &crate::printer::mesh::Leveling) -> Option<String> {
+    let on = match l.enabled? {
+        true => "leveling on",
+        false => "leveling off",
+    };
+    Some(match l.mesh.as_ref().and_then(|m| m.span().map(|s| (m, s))) {
+        Some((m, (lo, hi))) => {
+            format!("{on}, {} x {}, {:.2} mm range", m.columns(), m.rows.len(), hi - lo)
+        }
+        None => format!("{on}, no mesh"),
+    })
+}
+
+fn mesh_colour(v: f32, reach: f32) -> Color32 {
+    let t = (v.abs() / reach.max(0.01)).clamp(0.0, 1.0);
+    let far = if v < 0.0 { TRACE } else { READOUT };
+    let lerp = |a: u8, b: u8| (a as f32 + (b as f32 - a as f32) * t).round() as u8;
+    Color32::from_rgb(lerp(WELL.r(), far.r()), lerp(WELL.g(), far.g()), lerp(WELL.b(), far.b()))
+}
+
+fn mesh_map(ui: &mut Ui, m: &crate::printer::mesh::Mesh) {
+    let (cols, rows) = (m.columns().max(1), m.rows.len().max(1));
+    let reach = m.values().fold(0.0f32, |a, v| a.max(v.abs()));
+    let w = ui.available_width();
+    let cell = Vec2::new(w / cols as f32, (w / cols as f32 * 0.5).clamp(22.0, 40.0));
+    let label = 14.0;
+    let (rect, _) =
+        ui.allocate_exact_size(Vec2::new(w, cell.y * rows as f32 + label * 2.0), Sense::hover());
+    let p = ui.painter_at(rect);
+    p.text(
+        egui::pos2(rect.center().x, rect.top() + label / 2.0),
+        egui::Align2::CENTER_CENTER,
+        "BACK",
+        legend_font(10.0),
+        LEGEND,
+    );
+    p.text(
+        egui::pos2(rect.center().x, rect.bottom() - label / 2.0),
+        egui::Align2::CENTER_CENTER,
+        "FRONT",
+        legend_font(10.0),
+        LEGEND,
+    );
+    for (y, row) in m.rows.iter().enumerate() {
+        for (x, v) in row.iter().enumerate() {
+            let top = rect.top() + label + (rows - 1 - y) as f32 * cell.y;
+            let r = Rect::from_min_size(egui::pos2(rect.left() + x as f32 * cell.x, top), cell)
+                .shrink(1.0);
+            let (fill, text) = match v {
+                Some(v) => (mesh_colour(*v, reach), format!("{v:+.3}")),
+                None => (WELL, "-".into()),
+            };
+            p.rect_filled(r, 2.0, fill);
+            let ink =
+                if v.is_some_and(|v| v.abs() / reach.max(0.01) > 0.55) { CHASSIS } else { VALUE };
+            p.text(r.center(), egui::Align2::CENTER_CENTER, text, mono(11.0), ink);
+        }
+    }
 }
 
 fn progress_hero(ui: &mut Ui, label: &str, fraction: f32, tint: Color32) {
@@ -1277,6 +1521,8 @@ fn printer_info(ui: &mut Ui, d: &CardData, acts: &mut Vec<Act>) {
                 if ui.add(Key::new("bed is clear").solid(OK).min_width(140.0)).clicked() {
                     acts.push(Act::BedClear(i));
                 }
+            } else if let Some(a) = status.activity {
+                Line::new().legend("now").value(a).elided(ui);
             } else if let Some(job) = &next {
                 Line::new().legend("next").value(&job.name).elided(ui);
                 Line::new().note(job_summary(&job.meta)).size(10.5).elided(ui);
@@ -1294,6 +1540,9 @@ fn printer_info(ui: &mut Ui, d: &CardData, acts: &mut Vec<Act>) {
         }
     }
     heater_line(ui, status, &d.samples);
+    if let Some(said) = leveling_summary(&status.leveling) {
+        Line::new().legend("bed mesh").value(said).elided(ui);
+    }
     ui.add_space(6.0);
     ui.horizontal(|ui| {
         let online = !matches!(state, State::Offline | State::Connecting);
@@ -1308,6 +1557,9 @@ fn printer_info(ui: &mut Ui, d: &CardData, acts: &mut Vec<Act>) {
                 acts.push(Act::Gcode(i, "M104 S0\nM140 S0".into()));
             }
         });
+        if ui.add(Key::new("bed").outline(VALUE).enabled(online)).clicked() {
+            acts.push(Act::Mesh(i));
+        }
         if ui.add(Key::new("console").outline(VALUE)).clicked() {
             acts.push(Act::Console(i));
         }
