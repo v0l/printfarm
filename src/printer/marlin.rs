@@ -14,6 +14,7 @@ const POLL_EVERY: Duration = Duration::from_secs(2);
 const SD_POLL_BUSY: Duration = Duration::from_secs(3);
 const SD_POLL_IDLE: Duration = Duration::from_secs(10);
 const QUIET_POLL: Duration = Duration::from_secs(10);
+const HEAT_EXPIRY: Duration = Duration::from_secs(3);
 const POKE_AFTER: Duration = Duration::from_secs(15);
 const RETRY_AFTER: Duration = Duration::from_secs(3);
 const GIVE_UP_RETRY: Duration = Duration::from_secs(10);
@@ -91,6 +92,7 @@ pub struct Marlin {
     attached_at: Instant,
     last_poll: Instant,
     last_sd_poll: Instant,
+    last_heating: Option<Instant>,
     retry_at: Instant,
     poked: bool,
     pending: Vec<Event>,
@@ -124,6 +126,7 @@ impl Marlin {
             attached_at: now,
             last_poll: now,
             last_sd_poll: now,
+            last_heating: None,
             retry_at: now,
             poked: false,
             pending: Vec::new(),
@@ -154,6 +157,7 @@ impl Marlin {
         self.last_rx = now;
         self.attached_at = now;
         self.last_poll = now;
+        self.last_heating = None;
         self.poked = false;
         self.status.state = Some(State::Connecting);
         self.status.detail = format!("waiting for Marlin on {}", self.where_());
@@ -283,8 +287,11 @@ impl Marlin {
         let reported = !temps.is_empty();
         if reported {
             self.status.heaters = temps;
-            if self.job.as_ref().is_some_and(|r| !r.uploading()) {
-                self.status.activity = line.contains(" W:").then_some("heating");
+            if self.job.as_ref().is_some_and(|r| !r.uploading()) && line.contains(" W:") {
+                self.last_heating = Some(Instant::now());
+                if self.status.activity.is_none() {
+                    self.status.activity = Some("heating");
+                }
             }
         }
         if let Some(rest) = line.strip_prefix("ok") {
@@ -647,6 +654,17 @@ impl Marlin {
         }
     }
 
+    fn expire_heating(&mut self) {
+        if self.status.activity == Some("heating") {
+            if let Some(at) = self.last_heating
+                && at.elapsed() > HEAT_EXPIRY
+            {
+                self.status.activity = None;
+                self.last_heating = None;
+            }
+        }
+    }
+
     fn probe(&mut self, events: &mut Vec<Event>) {
         let Handshake::Probing { last, tries } = self.handshake else { return };
         let due = match last {
@@ -741,6 +759,7 @@ impl Printer for Marlin {
             self.write("M105", events);
         }
         self.pump(events);
+        self.expire_heating();
     }
 
     fn start(&mut self, job: Job) -> Result<(), String> {
@@ -1083,5 +1102,70 @@ mod tests {
         assert_eq!(resend_request("Resend:N42"), Some(42));
         assert_eq!(resend_request("rs N7"), Some(7));
         assert_eq!(resend_request("ok"), None);
+    }
+
+    fn with_job() -> Marlin {
+        let mut m = Marlin::new(String::new(), 0);
+        m.job = Some(Running {
+            progress: Progress {
+                job: Job {
+                    id: 1,
+                    name: "order".into(),
+                    path: std::path::PathBuf::from("order.gcode"),
+                    printer: None,
+                    added: 0,
+                    meta: Default::default(),
+                },
+                done: 10,
+                total: 100,
+                layer: 1,
+                started: SystemTime::now(),
+                paused: Duration::ZERO,
+                paused_since: None,
+                sending: false,
+            },
+            file: "PF000001.GCO".into(),
+            phase: Phase::OnPrinter,
+            layers: Vec::new(),
+            bytes: 100,
+        });
+        m
+    }
+
+    #[test]
+    fn a_heating_marker_survives_the_plain_reports_that_interleave() {
+        let mut m = with_job();
+        let mut ev = Vec::new();
+        m.line(" T:150.00 /210.00 B:35.00 /60.00 @:255 B@:255 W:20", &mut ev);
+        assert_eq!(m.status.activity, Some("heating"));
+        for _ in 0..5 {
+            m.line(" T:150.00 /210.00 B:35.00 /60.00 @:255 B@:255", &mut ev);
+            assert_eq!(m.status.activity, Some("heating"));
+        }
+        m.line(" T:160.00 /210.00 B:40.00 /60.00 @:255 B@:255 W:14", &mut ev);
+        assert_eq!(m.status.activity, Some("heating"));
+    }
+
+    #[test]
+    fn the_heating_label_expires_when_the_marker_stops() {
+        let mut m = with_job();
+        let mut ev = Vec::new();
+        m.line(" T:150.00 /210.00 B:35.00 /60.00 @:255 B@:255 W:20", &mut ev);
+        assert_eq!(m.status.activity, Some("heating"));
+        m.last_heating = Some(Instant::now() - HEAT_EXPIRY - Duration::from_secs(1));
+        m.expire_heating();
+        assert_eq!(m.status.activity, None);
+        m.line(" T:150.00 /210.00 B:35.00 /60.00 @:255 B@:255 W:19", &mut ev);
+        m.expire_heating();
+        assert_eq!(m.status.activity, Some("heating"));
+    }
+
+    #[test]
+    fn a_heating_marker_does_not_hide_a_specific_activity() {
+        let mut m = with_job();
+        let mut ev = Vec::new();
+        m.status.activity = Some("heating the bed");
+        m.line(" T:150.00 /210.00 B:35.00 /60.00 @:255 B@:255 W:20", &mut ev);
+        assert_eq!(m.status.activity, Some("heating the bed"));
     }
 }

@@ -89,6 +89,45 @@ fn param(cmd: &str, key: char) -> Option<f32> {
     cmd.split_whitespace().skip(1).find_map(|w| w.strip_prefix(key)?.parse().ok())
 }
 
+fn say(port: &mut TTYPort, text: &str) {
+    let _ = port.write_all(format!("{text}\n").as_bytes());
+}
+
+fn wait_for_heat(
+    port: &mut TTYPort,
+    heat: &mut Heaters,
+    rate: f32,
+    rx: &mut Vec<u8>,
+    autoreport: &mut Option<Instant>,
+    stop: &AtomicBool,
+    bed: bool,
+) {
+    let wait = Instant::now();
+    let mut buf = [0u8; 256];
+    loop {
+        if let Ok(n) = port.read(&mut buf) {
+            rx.extend_from_slice(&buf[..n]);
+        }
+        if rx.windows(5).any(|w| w == b"M108\n") {
+            break;
+        }
+        heat.tick(rate);
+        let (a, t) = if bed { heat.bed } else { heat.hotend };
+        if (a - t).abs() < 1.0
+            || wait.elapsed() > Duration::from_secs(120)
+            || stop.load(Ordering::Relaxed)
+        {
+            break;
+        }
+        say(port, &format!("{} W:?", heat.report()));
+        if let Some(at) = *autoreport && at.elapsed() > Duration::from_millis(300) {
+            say(port, &format!(" {}", heat.report()));
+            *autoreport = Some(Instant::now());
+        }
+        std::thread::sleep(Duration::from_millis(500));
+    }
+}
+
 fn arg(cmd: &str) -> String {
     cmd.split_whitespace().nth(1).unwrap_or("").to_ascii_uppercase()
 }
@@ -160,9 +199,24 @@ pub fn spawn(mut port: TTYPort, mut script: Script) -> Sim {
                             .iter()
                             .position(|b| *b == b'\n')
                             .map_or(data.len(), |i| pos + i + 1);
-                        heat.set(String::from_utf8_lossy(&data[pos..end]).trim());
+                        let line = String::from_utf8_lossy(&data[pos..end]).trim().to_string();
+                        heat.set(&line);
                         pos = end;
                         sd_due -= 1.0;
+                        let word = line.split_whitespace().next().unwrap_or("");
+                        if word == "M109" || word == "M190" {
+                            drop(c);
+                            wait_for_heat(
+                                &mut port,
+                                &mut heat,
+                                script.heat_rate,
+                                &mut rx,
+                                &mut autoreport,
+                                &st,
+                                word == "M190",
+                            );
+                            c = sd.lock().unwrap();
+                        }
                     }
                     if pos >= data.len() {
                         done = Some(open.name.clone());
@@ -253,25 +307,15 @@ pub fn spawn(mut port: TTYPort, mut script: Script) -> Sim {
                 }
                 heat.set(&cmd);
                 if word == "M109" || word == "M190" {
-                    let wait = Instant::now();
-                    loop {
-                        if let Ok(n) = port.read(&mut buf) {
-                            rx.extend_from_slice(&buf[..n]);
-                        }
-                        if rx.windows(5).any(|w| w == b"M108\n") {
-                            break;
-                        }
-                        heat.tick(script.heat_rate);
-                        let (a, t) = if word == "M109" { heat.hotend } else { heat.bed };
-                        if (a - t).abs() < 1.0
-                            || wait.elapsed() > Duration::from_secs(120)
-                            || st.load(Ordering::Relaxed)
-                        {
-                            break;
-                        }
-                        say(&mut port, &format!("{} W:?", heat.report()));
-                        std::thread::sleep(Duration::from_millis(500));
-                    }
+                    wait_for_heat(
+                        &mut port,
+                        &mut heat,
+                        script.heat_rate,
+                        &mut rx,
+                        &mut autoreport,
+                        &st,
+                        word == "M190",
+                    );
                 }
                 if word.starts_with("G1") || word.starts_with("G0") {
                     std::thread::sleep(script.move_delay);

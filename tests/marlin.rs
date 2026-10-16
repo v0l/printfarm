@@ -135,6 +135,28 @@ fn copies_the_file_to_the_card_and_prints_it_from_there() {
 }
 
 #[test]
+fn a_slicer_heating_wait_keeps_the_label_up() {
+    let (mut m, _b) =
+        connected(Script { heat_rate: 40.0, sd_lines_per_s: 100.0, ..Default::default() });
+    let body = "G28\nM104 S0\nM140 S0\nM109 S150\nG1 X10\nG1 X20\nM104 S0\n";
+    m.start(job(21, "heat-wait", body)).unwrap();
+    let mut ev = Vec::new();
+    until(&mut m, &mut ev, "the copy", |_, ev| on_printer(ev));
+    until(&mut m, &mut ev, "the heating wait", |m, _| {
+        m.status().activity == Some("heating")
+    });
+    let t = Instant::now();
+    while t.elapsed() < Duration::from_secs(1) {
+        m.step(&mut ev);
+        assert_eq!(m.status().activity, Some("heating"), "the label flickered out");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    until(&mut m, &mut ev, "the label to go", |m, _| m.status().activity.is_none());
+    until(&mut m, &mut ev, "the print to end", |_, ev| finished(ev).is_some());
+    assert_eq!(finished(&ev).unwrap().0, Outcome::Done);
+}
+
+#[test]
 fn the_print_carries_on_without_printfarm_and_is_picked_up_again() {
     let (b, host) = bench(Script { sd_lines_per_s: 100.0, ..Default::default() });
     let (mut m, _) = ready(Box::new(host), None);
