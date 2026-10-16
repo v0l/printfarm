@@ -892,11 +892,15 @@ impl App {
             let m = egui::Modal::new(Id::new("probe")).show(ctx, |ui| {
                 ui.set_width(400.0);
                 modal_title(ui, &format!("Probe the bed on {name}?"));
-                note(ui, "It homes and then touches the bed at every mesh point. Make sure the bed is empty.", LEGEND);
+                note(
+                    ui,
+                    "It homes and then touches the bed at every mesh point. Make sure the bed is empty. Some firmware heats the nozzle and bed itself before probing; the heaters go back to how they were once it is done.",
+                    LEGEND,
+                );
                 ui.add_space(6.0);
                 row_help(ui, "bed", "A bed moves as it heats, so probe it at the temperature you print at.", |ui| {
                     choice(ui, "probe heat", &mut pick, [
-                        (0, "cold".to_string()),
+                        (0, "no extra heat".to_string()),
                         (60, "60 °C, PLA".to_string()),
                         (65, "65 °C".to_string()),
                         (80, "80 °C, PETG".to_string()),
@@ -912,7 +916,10 @@ impl App {
                 });
             });
             if go {
-                self.stations[i].send(Control::Gcode(probe_gcode(pick)));
+                let status = self.stations[i].status();
+                let target = |name: &str| status.heater(name).map_or(0.0, |h| h.target);
+                let gcode = probe_gcode(pick, target("hotend"), target("bed"));
+                self.stations[i].send(Control::Gcode(gcode));
                 self.probing = None;
             } else if m.should_close() {
                 self.probing = None;
@@ -1289,49 +1296,37 @@ fn heater_line(ui: &mut Ui, status: &crate::printer::Status, samples: &HashMap<S
         return;
     }
     ui.add_space(6.0);
-    let mut line = Line::new();
-    for (n, h) in status.heaters.iter().enumerate() {
-        if n > 0 {
-            line = line.gap(18.0);
-        }
-        line = line.legend(&h.name).measured(format!("{:.1} °C", h.actual));
-        if h.target > 0.0 {
-            line = line.note(" / ").set(format!("{:.0}", h.target));
-        }
-    }
-    line.show(ui);
-    let traced: Vec<_> = status
-        .heaters
-        .iter()
-        .filter_map(|h| samples.get(&h.name).filter(|p| p.len() > 1).map(|p| (h, p)))
-        .collect();
-    if traced.is_empty() {
-        return;
-    }
+    let n = status.heaters.len();
     ui.horizontal(|ui| {
         let gap = 8.0;
-        let w = (ui.available_width() - gap * (traced.len() as f32 - 1.0)) / traced.len() as f32;
+        let w = (ui.available_width() - gap * (n as f32 - 1.0)) / n as f32;
         ui.spacing_mut().item_spacing.x = gap;
-        for (h, points) in traced {
-            let hi = points.iter().copied().fold(h.target.max(50.0), f32::max) * 1.1;
-            let mut t = Trace::new(points).size(Vec2::new(w, 26.0)).range(0.0, hi);
+        for h in &status.heaters {
+            let points = samples.get(&h.name).map(Vec::as_slice).unwrap_or_default();
+            let hi = points.iter().copied().fold(h.target.max(50.0), f32::max) * 1.6;
+            let mut t = Trace::new(points).size(Vec2::new(w, 38.0)).range(0.0, hi);
             if h.target > 0.0 {
                 t = t.rule(h.target);
             }
-            ui.add(t).on_hover_text(&h.name);
+            let rect = ui.add(t).rect;
+            let mut line = Line::new().legend(&h.name).measured(format!("{:.1} °C", h.actual));
+            if h.target > 0.0 {
+                line = line.note(" / ").set(format!("{:.0}", h.target));
+            }
+            let galley = ui.painter().layout_job(line.job());
+            ui.painter_at(rect).galley(rect.left_top() + Vec2::new(6.0, 3.0), galley, VALUE);
         }
     });
 }
 
-fn probe_gcode(bed: u32) -> String {
+fn probe_gcode(bed: u32, hotend_was: f32, bed_was: f32) -> String {
     let mut g = Vec::new();
     if bed > 0 {
         g.push(format!("M190 S{bed}"));
     }
     g.extend(["G28".to_string(), "G29".to_string(), "M420 V".to_string()]);
-    if bed > 0 {
-        g.push("M140 S0".into());
-    }
+    g.push(format!("M104 S{hotend_was:.0}"));
+    g.push(format!("M140 S{bed_was:.0}"));
     g.join("\n")
 }
 
@@ -1660,4 +1655,16 @@ pub fn run(open: Vec<PathBuf>) -> eframe::Result<()> {
         opts,
         Box::new(move |cc| Ok(Box::new(App::new(&cc.egui_ctx, open)))),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn probing_puts_the_heaters_back() {
+        assert_eq!(probe_gcode(0, 0.0, 0.0), "G28\nG29\nM420 V\nM104 S0\nM140 S0");
+        assert_eq!(probe_gcode(60, 0.0, 0.0), "M190 S60\nG28\nG29\nM420 V\nM104 S0\nM140 S0");
+        assert_eq!(probe_gcode(0, 150.0, 60.0), "G28\nG29\nM420 V\nM104 S150\nM140 S60");
+    }
 }
