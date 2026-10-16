@@ -1,3 +1,4 @@
+use super::mesh::{GridReader, Mesh, grid_title};
 use super::{Dir, Event, Heater, Job, Outcome, Printer, Progress, State, Status};
 use crate::gcode;
 use serialport::SerialPort;
@@ -63,6 +64,7 @@ pub struct Marlin {
     retry_at: Instant,
     poked: bool,
     pending: Vec<Event>,
+    grid: Option<GridReader>,
 }
 
 impl Marlin {
@@ -88,6 +90,7 @@ impl Marlin {
             retry_at: now,
             poked: false,
             pending: Vec::new(),
+            grid: None,
         }
     }
 
@@ -114,6 +117,9 @@ impl Marlin {
         self.status.state = Some(State::Connecting);
         self.status.detail = format!("waiting for Marlin on {}", self.where_());
         self.status.heaters.clear();
+        self.status.leveling = Default::default();
+        self.status.activity = None;
+        self.grid = None;
     }
 
     fn where_(&self) -> String {
@@ -201,6 +207,21 @@ impl Marlin {
     }
 
     fn line(&mut self, line: &str, events: &mut Vec<Event>) {
+        if let Some(g) = self.grid.as_mut() {
+            if g.feed(line) {
+                events.push(Event::Console(Dir::Received, line.to_string()));
+                return;
+            }
+            if let Some(rows) = self.grid.take().and_then(GridReader::finish) {
+                let probed = self.status.activity == activity("G29");
+                self.status.leveling.mesh = Some(Mesh { rows, read: SystemTime::now(), probed });
+            }
+        }
+        if let Some(keep) = grid_title(line) {
+            self.grid = Some(GridReader::new(keep));
+            events.push(Event::Console(Dir::Received, line.to_string()));
+            return;
+        }
         let temps = temperatures(line);
         let reported = !temps.is_empty();
         if reported {
@@ -227,6 +248,7 @@ impl Marlin {
         } else if line.contains("FIRMWARE_NAME:") {
             self.status.firmware = field(line, "FIRMWARE_NAME");
             self.status.machine = field(line, "MACHINE_TYPE");
+        } else if self.status.leveling.read_state(line) {
         } else if line.starts_with("Cap:AUTOREPORT_TEMP:1") {
             self.autoreport = true;
         } else if let Some(action) = line.strip_prefix("//action:") {
@@ -267,6 +289,7 @@ impl Marlin {
             } else {
                 self.manual.push_back(Queued::Plain("M105".into()));
             }
+            self.manual.push_back(Queued::Plain("M420 V".into()));
             if self.status.state() == State::Connecting {
                 self.status.state = Some(State::Idle);
             }
@@ -283,7 +306,7 @@ impl Marlin {
             }
             return;
         }
-        if was == Some(Kind::Job) {
+        if matches!(was, Some(Kind::Job | Kind::Manual)) {
             self.status.activity = None;
         }
         if was == Some(Kind::Final) {
@@ -358,7 +381,10 @@ impl Marlin {
         }
         if let Some(q) = self.manual.pop_front() {
             match q {
-                Queued::Plain(cmd) => self.send_numbered(&cmd, Kind::Manual, events),
+                Queued::Plain(cmd) => {
+                    self.status.activity = activity(&cmd);
+                    self.send_numbered(&cmd, Kind::Manual, events);
+                }
                 Queued::Resync => {
                     let n = self.next_n;
                     self.send_numbered(&format!("M110 N{n}"), Kind::Setup, events);

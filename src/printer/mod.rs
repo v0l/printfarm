@@ -1,4 +1,5 @@
 pub mod marlin;
+pub mod mesh;
 #[cfg(unix)]
 pub mod sim;
 
@@ -100,6 +101,7 @@ pub struct Status {
     pub progress: Option<Progress>,
     pub message: Option<String>,
     pub activity: Option<&'static str>,
+    pub leveling: mesh::Leveling,
 }
 
 impl Status {
