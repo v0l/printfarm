@@ -1,0 +1,42 @@
+[package]
+name = "printfarm"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.92"
+license = "MIT"
+description = "One window for every 3D printer: state, temperatures, progress, camera, job queue and history"
+repository = "https://github.com/v0l/printfarm"
+
+[features]
+default = ["tls"]
+tls = ["ureq/rustls"]
+
+[dependencies]
+base64 = "0.22"
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+clap = { version = "4.6", features = ["derive"] }
+dirs = "6"
+eframe = { version = "0.35", default-features = false, features = [
+    "default_fonts",
+    "glow",
+    "wayland",
+    "x11",
+] }
+egui = "0.35"
+egui_bench = "0.4"
+image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serialport = "4.10"
+toml = "0.9"
+ureq = { version = "3.4", default-features = false, features = ["gzip"] }
+
+[target.'cfg(windows)'.build-dependencies]
+winresource = "0.1"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+
+[profile.dev]
+opt-level = 1

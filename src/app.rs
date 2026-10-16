@@ -1,0 +1,1325 @@
+use crate::camera::Camera;
+use crate::config::{self, Config, Link, PrinterConfig};
+use crate::farm::{self, Queue, Record};
+use crate::gcode;
+use crate::printer::marlin::{self, BAUDS, Detected, PortInfo};
+use crate::printer::{Dir, Event, Outcome, State};
+use crate::station::{Control, Station, Wake};
+use egui::{Color32, FontId, Id, Sense, Stroke, TextureHandle, TextureOptions, Ui, Vec2};
+use egui_bench::prelude::*;
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::mpsc::{Receiver, Sender, channel};
+use std::time::{Duration, SystemTime};
+
+const CARD_W: f32 = 380.0;
+const PRESETS: [(&str, u32, u32); 3] = [("PLA", 210, 60), ("PETG", 240, 80), ("ABS", 250, 100)];
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Tab {
+    Printers,
+    Queue,
+    History,
+}
+
+enum Act {
+    Start(usize, u64),
+    Pause(usize),
+    Resume(usize),
+    Cancel(usize),
+    Gcode(usize, String),
+    Reconnect(usize),
+    BedClear(usize),
+    Edit(Option<usize>),
+    Remove(usize),
+    Console(usize),
+    Camera(usize),
+    Pick(Option<String>),
+    Shift(u64, isize),
+    Drop(u64),
+    Assign(u64, Option<String>),
+    Again(usize),
+}
+
+struct Editor {
+    index: Option<usize>,
+    name: String,
+    port: String,
+    baud: u32,
+    camera: String,
+    ports: Vec<PortInfo>,
+    detecting: Option<Receiver<Result<Detected, String>>>,
+    found: Option<(bool, String)>,
+}
+
+impl Editor {
+    fn new(index: Option<usize>, existing: Option<&PrinterConfig>) -> Editor {
+        let ports = marlin::ports();
+        let (port, baud) = match existing.map(|p| &p.link) {
+            Some(Link::MarlinUsb { port, baud }) => (port.clone(), *baud),
+            None => (ports.first().map(|p| p.path.clone()).unwrap_or_default(), 115200),
+        };
+        Editor {
+            index,
+            name: existing.map(|p| p.name.clone()).unwrap_or_default(),
+            port,
+            baud,
+            camera: existing.and_then(|p| p.camera.clone()).unwrap_or_default(),
+            ports,
+            detecting: None,
+            found: None,
+        }
+    }
+}
+
+struct Thumb {
+    texture: Option<TextureHandle>,
+}
+
+pub struct App {
+    config: Config,
+    config_path: PathBuf,
+    stations: Vec<Station>,
+    cameras: HashMap<String, Camera>,
+    frames: HashMap<String, (u64, TextureHandle)>,
+    thumbs: HashMap<PathBuf, Thumb>,
+    queue: Queue,
+    queue_path: PathBuf,
+    history: Vec<Record>,
+    history_path: PathBuf,
+    events: Receiver<(String, Event)>,
+    events_tx: Sender<(String, Event)>,
+    wake: Wake,
+    tab: Tab,
+    editor: Option<Editor>,
+    browser: Option<(Browser, Option<String>)>,
+    console: Option<String>,
+    console_line: String,
+    removing: Option<usize>,
+    cancelling: Option<usize>,
+    closing: bool,
+    quitting: bool,
+    big_camera: Option<String>,
+    notice: Option<(bool, String)>,
+}
+
+impl App {
+    pub fn new(ctx: &egui::Context, open: Vec<PathBuf>) -> App {
+        egui_bench::install(ctx);
+        let c = ctx.clone();
+        let wake: Wake = Arc::new(move || c.request_repaint());
+        let (events_tx, events) = channel();
+        let config_path = config::config_path();
+        let queue_path = farm::queue_path();
+        let history_path = farm::history_path();
+        let mut notice = None;
+        let config = Config::load(&config_path).unwrap_or_else(|e| {
+            notice = Some((false, e));
+            Config::default()
+        });
+        let queue = Queue::load(&queue_path).unwrap_or_else(|e| {
+            notice = Some((false, e));
+            Queue::default()
+        });
+        let mut app = App {
+            config,
+            config_path,
+            stations: Vec::new(),
+            cameras: HashMap::new(),
+            frames: HashMap::new(),
+            thumbs: HashMap::new(),
+            queue,
+            queue_path,
+            history: farm::history(&history_path),
+            history_path,
+            events,
+            events_tx,
+            wake,
+            tab: Tab::Printers,
+            editor: None,
+            browser: None,
+            console: None,
+            console_line: String::new(),
+            removing: None,
+            cancelling: None,
+            closing: false,
+            quitting: false,
+            big_camera: None,
+            notice,
+        };
+        for (printer, run) in app.queue.orphans() {
+            let name = app.printer_name(&printer);
+            let mut record = Record::new(
+                &run.job,
+                &name,
+                run.started,
+                Outcome::Failed,
+                "printfarm closed during the print",
+            );
+            record.ended = run.started;
+            app.log(record);
+            app.queue.unclear.insert(printer);
+        }
+        app.save_queue();
+        app.restart_stations();
+        for path in open {
+            app.enqueue(&path, None);
+        }
+        app
+    }
+
+    fn printer_name(&self, id: &str) -> String {
+        self.config
+            .printers
+            .iter()
+            .find(|p| p.id == id)
+            .map(|p| p.name.clone())
+            .unwrap_or_else(|| id.to_string())
+    }
+
+    fn restart_stations(&mut self) {
+        self.stations.clear();
+        for p in &self.config.printers {
+            self.stations.push(Station::spawn(
+                p.clone(),
+                self.events_tx.clone(),
+                self.wake.clone(),
+            ));
+        }
+        self.sync_cameras();
+    }
+
+    fn sync_cameras(&mut self) {
+        let want: HashMap<String, String> = self
+            .config
+            .printers
+            .iter()
+            .filter_map(|p| {
+                p.camera.clone().filter(|u| !u.trim().is_empty()).map(|u| (p.id.clone(), u))
+            })
+            .collect();
+        self.cameras.retain(|id, cam| want.get(id) == Some(&cam.url));
+        self.frames.retain(|id, _| want.contains_key(id));
+        for (id, url) in want {
+            if !self.cameras.contains_key(&id) {
+                self.cameras.insert(id, Camera::start(url, self.wake.clone()));
+            }
+        }
+    }
+
+    fn save_config(&mut self) {
+        if let Err(e) = self.config.save(&self.config_path) {
+            self.notice = Some((false, e));
+        }
+    }
+
+    fn save_queue(&mut self) {
+        if let Err(e) = self.queue.save(&self.queue_path) {
+            self.notice = Some((false, e));
+        }
+    }
+
+    fn log(&mut self, record: Record) {
+        if let Err(e) = farm::append(&self.history_path, &record) {
+            self.notice = Some((false, e));
+        }
+        self.history.push(record);
+    }
+
+    fn enqueue(&mut self, path: &Path, printer: Option<String>) {
+        match self.queue.add(path, printer) {
+            Ok(id) => {
+                let name = self.queue.find(id).map(|j| j.name.clone()).unwrap_or_default();
+                self.notice = Some((true, format!("{name} is queued")));
+                self.save_queue();
+            }
+            Err(e) => self.notice = Some((false, e)),
+        }
+    }
+
+    fn events(&mut self) {
+        while let Ok((printer, e)) = self.events.try_recv() {
+            let name = self.printer_name(&printer);
+            match e {
+                Event::Started(job) => {
+                    self.queue.running.insert(printer, farm::Running { job, started: farm::now() });
+                    self.save_queue();
+                }
+                Event::Refused(job, why) => {
+                    self.notice =
+                        Some((false, format!("{name} did not start {}: {why}", job.name)));
+                    self.queue.jobs.insert(0, job);
+                    self.save_queue();
+                }
+                Event::Finished { job, outcome, started, reason } => {
+                    let said = match outcome {
+                        Outcome::Done => format!("{} finished on {name}", job.name),
+                        Outcome::Cancelled => format!("{} was cancelled on {name}", job.name),
+                        Outcome::Failed => format!("{} failed on {name}: {reason}", job.name),
+                    };
+                    self.notice = Some((outcome == Outcome::Done, said));
+                    self.log(Record::new(&job, &name, farm::unix(started), outcome, &reason));
+                    self.queue.running.remove(&printer);
+                    self.queue.unclear.insert(printer);
+                    self.save_queue();
+                }
+                Event::Console(..) => {}
+            }
+        }
+    }
+
+    fn apply(&mut self, acts: Vec<Act>) {
+        for act in acts {
+            match act {
+                Act::Start(i, id) => {
+                    if let Some(job) = self.queue.take(id) {
+                        self.stations[i].send(Control::Start(job));
+                        self.save_queue();
+                    }
+                }
+                Act::Pause(i) => self.stations[i].send(Control::Pause),
+                Act::Resume(i) => self.stations[i].send(Control::Resume),
+                Act::Cancel(i) => self.cancelling = Some(i),
+                Act::Gcode(i, g) => self.stations[i].send(Control::Gcode(g)),
+                Act::Reconnect(i) => self.stations[i].send(Control::Reconnect),
+                Act::BedClear(i) => {
+                    self.queue.unclear.remove(&self.config.printers[i].id);
+                    self.save_queue();
+                }
+                Act::Edit(i) => {
+                    self.editor = Some(Editor::new(i, i.map(|i| &self.config.printers[i])))
+                }
+                Act::Remove(i) => self.removing = Some(i),
+                Act::Console(i) => self.console = Some(self.config.printers[i].id.clone()),
+                Act::Camera(i) => self.big_camera = Some(self.config.printers[i].id.clone()),
+                Act::Pick(printer) => {
+                    let dir = self
+                        .queue
+                        .jobs
+                        .last()
+                        .and_then(|j| j.path.parent().map(Path::to_path_buf))
+                        .or_else(dirs::home_dir)
+                        .unwrap_or_default();
+                    self.browser = Some((
+                        Browser::new("queue a G-code file", dir).suffixes(&gcode::SUFFIXES),
+                        printer,
+                    ));
+                }
+                Act::Shift(id, by) => {
+                    self.queue.shift(id, by);
+                    self.save_queue();
+                }
+                Act::Drop(id) => {
+                    self.queue.take(id);
+                    self.save_queue();
+                }
+                Act::Assign(id, p) => {
+                    self.queue.assign(id, p);
+                    self.save_queue();
+                }
+                Act::Again(i) => {
+                    let path = self.history[i].path.clone();
+                    let printer = self
+                        .config
+                        .printers
+                        .iter()
+                        .find(|p| p.name == self.history[i].printer)
+                        .map(|p| p.id.clone());
+                    self.enqueue(&path, printer);
+                }
+            }
+        }
+    }
+
+    fn busy(&self) -> Vec<String> {
+        self.stations
+            .iter()
+            .filter(|s| s.status().state().busy())
+            .map(|s| s.config.name.clone())
+            .collect()
+    }
+
+    fn header(&mut self, ui: &mut Ui, acts: &mut Vec<Act>) {
+        ui.horizontal(|ui| {
+            ui.label(egui::RichText::new("PRINTFARM").font(legend_font(17.0)).color(VALUE));
+            ui.add_space(18.0);
+            let queued = self.queue.jobs.len();
+            let opts = [
+                (Tab::Printers, format!("printers {}", self.stations.len())),
+                (Tab::Queue, format!("queue {queued}")),
+                (Tab::History, format!("history {}", self.history.len())),
+            ];
+            let opts: Vec<(Tab, &str)> = opts.iter().map(|(t, s)| (*t, s.as_str())).collect();
+            ui.allocate_ui(Vec2::new(360.0, 24.0), |ui| tabs(ui, &mut self.tab, &opts));
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui.add(Key::new("add printer").outline(VALUE)).clicked() {
+                    acts.push(Act::Edit(None));
+                }
+                if ui.add(Key::new("queue g-code").outline(READOUT)).clicked() {
+                    acts.push(Act::Pick(None));
+                }
+            });
+        });
+    }
+
+    fn printers(&mut self, ui: &mut Ui, acts: &mut Vec<Act>) {
+        if self.stations.is_empty() {
+            section(ui, "no printers yet", "", |ui| {
+                note(
+                    ui,
+                    "Add a printer to see its state, temperatures and camera here. A Marlin printer on a USB cable is found by its serial port; the speed can be detected.",
+                    LEGEND,
+                );
+                ui.add_space(8.0);
+                if ui.add(Key::new("add printer").solid(READOUT)).clicked() {
+                    acts.push(Act::Edit(None));
+                }
+            });
+            return;
+        }
+        let cols = ((ui.available_width() / CARD_W).floor() as usize).clamp(1, self.stations.len());
+        let now = SystemTime::now();
+        ui.columns(cols, |columns| {
+            for i in 0..self.stations.len() {
+                let ui = &mut columns[i % cols];
+                self.printer_card(ui, i, now, acts);
+                ui.add_space(10.0);
+            }
+        });
+    }
+
+    fn camera_texture(
+        &mut self,
+        ctx: &egui::Context,
+        id: &str,
+    ) -> (Option<(egui::TextureId, Vec2)>, Option<String>) {
+        let Some(cam) = self.cameras.get(id) else { return (None, None) };
+        let Ok(feed) = cam.feed.lock() else { return (None, None) };
+        let error = feed.error.clone();
+        if let Some(f) = &feed.frame {
+            let image = || egui::ColorImage::from_rgba_unmultiplied([f.width, f.height], &f.rgba);
+            match self.frames.get_mut(id) {
+                Some((seq, tex)) if *seq != f.seq => {
+                    tex.set(image(), TextureOptions::LINEAR);
+                    *seq = f.seq;
+                }
+                Some(_) => {}
+                None => {
+                    let tex =
+                        ctx.load_texture(format!("camera {id}"), image(), TextureOptions::LINEAR);
+                    self.frames.insert(id.to_string(), (f.seq, tex));
+                }
+            }
+        }
+        let tex = self.frames.get(id).map(|(_, t)| (t.id(), t.size_vec2()));
+        (tex, error)
+    }
+
+    fn printer_card(&mut self, ui: &mut Ui, i: usize, now: SystemTime, acts: &mut Vec<Act>) {
+        let station = &self.stations[i];
+        let config = station.config.clone();
+        let status = station.status();
+        let samples = station.shared.lock().map(|s| heater_series(&s.samples)).unwrap_or_default();
+        let refused = station.shared.lock().ok().and_then(|mut s| s.refused.take());
+        if let Some(r) = refused {
+            self.notice = Some((false, format!("{}: {r}", config.name)));
+        }
+        let state = status.state();
+        let tint = state_tint(state);
+        let unclear = self.queue.unclear.contains(&config.id);
+        let next = self.queue.next_for(&config.id).cloned();
+        let (frame, cam_error) = self.camera_texture(ui.ctx(), &config.id);
+        card(
+            ui,
+            Some(tint),
+            |ui| {
+                Line::new().legend(&config.name).show(ui);
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    chip(ui, state.label(), tint, state != State::Offline);
+                });
+            },
+            |ui| {
+                if let Some((tex, size)) = frame {
+                    let room = Vec2::new(
+                        ui.available_width(),
+                        (ui.available_width() * 9.0 / 16.0).min(240.0),
+                    );
+                    let scale = (room.x / size.x).min(room.y / size.y);
+                    let r = ui
+                        .vertical_centered(|ui| {
+                            ui.add(egui::Image::new((tex, size * scale)).sense(Sense::click()))
+                        })
+                        .inner;
+                    if r.on_hover_text("open the camera").clicked() {
+                        acts.push(Act::Camera(i));
+                    }
+                } else if config.camera.is_some() {
+                    note(ui, cam_error.as_deref().unwrap_or("waiting for the camera"), LEGEND);
+                }
+                let what = [status.machine.clone(), status.firmware.clone()]
+                    .into_iter()
+                    .flatten()
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                Line::new()
+                    .note(if what.is_empty() { config.link.summary() } else { what })
+                    .size(10.5)
+                    .elided(ui);
+                ui.add_space(2.0);
+                match state {
+                    State::Offline | State::Connecting => {
+                        note(
+                            ui,
+                            &status.detail,
+                            if state == State::Offline { WARN } else { LEGEND },
+                        );
+                    }
+                    State::Fault => {
+                        note(ui, &status.detail, FAULT);
+                        ui.add_space(4.0);
+                        if ui.add(Key::new("reconnect").outline(VALUE)).clicked() {
+                            acts.push(Act::Reconnect(i));
+                        }
+                    }
+                    State::Printing | State::Paused => {
+                        if let Some(p) = &status.progress {
+                            let pct = format!("{:.1}", p.fraction() * 100.0);
+                            hero(
+                                ui,
+                                &p.job.name,
+                                &pct,
+                                "%",
+                                if state == State::Paused { WARN } else { TRACE },
+                            );
+                            let r = ui
+                                .allocate_exact_size(
+                                    Vec2::new(ui.available_width(), 8.0),
+                                    Sense::hover(),
+                                )
+                                .0;
+                            bar(
+                                ui.painter(),
+                                r,
+                                p.fraction(),
+                                if state == State::Paused { WARN } else { TRACE },
+                            );
+                            ui.add_space(4.0);
+                            let layers = if p.job.meta.layers > 0 {
+                                format!("{} / {}", p.layer, p.job.meta.layers)
+                            } else {
+                                p.layer.to_string()
+                            };
+                            readouts(
+                                ui,
+                                &[
+                                    ("elapsed", hms(p.elapsed(now)), VALUE),
+                                    (
+                                        "left",
+                                        p.remaining(now).map(hms).unwrap_or("-".into()),
+                                        VALUE,
+                                    ),
+                                    ("layer", layers, VALUE),
+                                ],
+                            );
+                            if let Some(a) = status.activity {
+                                Line::new().legend("now").value(a).elided(ui);
+                            }
+                            if let Some(m) = &status.message {
+                                Line::new().legend("says").value(m).elided(ui);
+                            }
+                        }
+                        ui.horizontal(|ui| {
+                            let (label, act) = if state == State::Paused {
+                                ("resume", Act::Resume(i))
+                            } else {
+                                ("pause", Act::Pause(i))
+                            };
+                            if ui.add(Key::new(label).solid(READOUT).min_width(100.0)).clicked() {
+                                acts.push(act);
+                            }
+                            if ui.add(Key::new("cancel").outline(FAULT).min_width(100.0)).clicked()
+                            {
+                                acts.push(Act::Cancel(i));
+                            }
+                        });
+                    }
+                    State::Idle => {
+                        if unclear {
+                            note(
+                                ui,
+                                "The last print may still be on the bed. Clear it before the next one starts.",
+                                WARN,
+                            );
+                            ui.add_space(4.0);
+                            if ui.add(Key::new("bed is clear").solid(OK).min_width(140.0)).clicked()
+                            {
+                                acts.push(Act::BedClear(i));
+                            }
+                        } else if let Some(job) = &next {
+                            Line::new().legend("next").value(&job.name).elided(ui);
+                            Line::new().note(job_summary(&job.meta)).size(10.5).elided(ui);
+                            ui.add_space(4.0);
+                            if ui.add(Key::new("start").solid(READOUT).min_width(140.0)).clicked() {
+                                acts.push(Act::Start(i, job.id));
+                            }
+                        } else {
+                            note(
+                                ui,
+                                "Nothing queued for this printer. Drop a G-code file on the window to queue it.",
+                                LEGEND,
+                            );
+                        }
+                    }
+                }
+                if !status.heaters.is_empty() {
+                    ui.add_space(6.0);
+                    for h in &status.heaters {
+                        let mut line = Line::new()
+                            .legend(&h.name)
+                            .column(ui, 70.0)
+                            .measured(format!("{:.1} °C", h.actual));
+                        if h.target > 0.0 {
+                            line = line.note("  set ").set(format!("{:.0} °C", h.target));
+                        }
+                        line.show(ui);
+                        if let Some(points) = samples.get(&h.name)
+                            && points.len() > 1
+                        {
+                            let hi =
+                                points.iter().copied().fold(h.target.max(50.0), f32::max) * 1.1;
+                            let mut t = Trace::new(points)
+                                .size(Vec2::new(ui.available_width(), 26.0))
+                                .range(0.0, hi);
+                            if h.target > 0.0 {
+                                t = t.rule(h.target);
+                            }
+                            ui.add(t);
+                        }
+                    }
+                }
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    let online = !matches!(state, State::Offline | State::Connecting);
+                    let heat = ui.add(Key::new("heat").outline(VALUE).enabled(online));
+                    egui::Popup::menu(&heat).width(200.0).show(|ui| {
+                        for (name, hotend, bed) in PRESETS {
+                            if ui.button(action(format!("{name}  {hotend} / {bed} °C"))).clicked()
+                            {
+                                acts.push(Act::Gcode(i, format!("M104 S{hotend}\nM140 S{bed}")));
+                            }
+                        }
+                        if ui.button(action("Cool down")).clicked() {
+                            acts.push(Act::Gcode(i, "M104 S0\nM140 S0".into()));
+                        }
+                    });
+                    if ui.add(Key::new("console").outline(VALUE)).clicked() {
+                        acts.push(Act::Console(i));
+                    }
+                    let more = ui.add(Key::more().id_salt(("more", i)));
+                    egui::Popup::menu(&more).width(200.0).show(|ui| {
+                        if ui.button(action("Queue a file for this printer…")).clicked() {
+                            acts.push(Act::Pick(Some(config.id.clone())));
+                        }
+                        if ui
+                            .add_enabled(!state.busy(), egui::Button::new(action("Edit")))
+                            .clicked()
+                        {
+                            acts.push(Act::Edit(Some(i)));
+                        }
+                        if ui.button(action("Reconnect")).clicked() {
+                            acts.push(Act::Reconnect(i));
+                        }
+                        if ui
+                            .add_enabled(!state.busy(), egui::Button::new(action("Remove")))
+                            .clicked()
+                        {
+                            acts.push(Act::Remove(i));
+                        }
+                    });
+                });
+            },
+        );
+    }
+
+    fn thumb(&mut self, ctx: &egui::Context, path: &Path) -> Option<egui::TextureId> {
+        let t = self.thumbs.entry(path.to_path_buf()).or_insert_with(|| Thumb {
+            texture: gcode::thumbnail(path).map(|t| {
+                ctx.load_texture(
+                    format!("thumb {}", path.display()),
+                    egui::ColorImage::from_rgba_unmultiplied([t.width, t.height], &t.rgba),
+                    TextureOptions::LINEAR,
+                )
+            }),
+        });
+        t.texture.as_ref().map(|t| t.id())
+    }
+
+    fn queue_tab(&mut self, ui: &mut Ui, acts: &mut Vec<Act>) {
+        let jobs = self.queue.jobs.clone();
+        let printers: Vec<(Option<String>, String)> =
+            std::iter::once((None, "any printer".to_string()))
+                .chain(self.config.printers.iter().map(|p| (Some(p.id.clone()), p.name.clone())))
+                .collect();
+        section(ui, "queue", "a printer offers the first job here that it can take", |ui| {
+            if jobs.is_empty() {
+                note(
+                    ui,
+                    "The queue is empty. Drop G-code files on the window, or use queue g-code.",
+                    LEGEND,
+                );
+                return;
+            }
+            for (n, job) in jobs.iter().enumerate() {
+                if n > 0 {
+                    let y = ui.cursor().top();
+                    let r = ui.max_rect();
+                    ui.painter().line_segment(
+                        [egui::pos2(r.left(), y), egui::pos2(r.right(), y)],
+                        Stroke::new(1.0, ETCH),
+                    );
+                    ui.add_space(4.0);
+                }
+                ui.horizontal(|ui| {
+                    let size = Vec2::new(72.0, 54.0);
+                    match self.thumb(ui.ctx(), &job.path) {
+                        Some(tex) => {
+                            ui.add(
+                                egui::Image::new((tex, size))
+                                    .maintain_aspect_ratio(true)
+                                    .fit_to_exact_size(size),
+                            );
+                        }
+                        None => {
+                            let (r, _) = ui.allocate_exact_size(size, Sense::hover());
+                            ui.painter().rect_filled(r, 2.0, WELL);
+                            ui.painter().text(
+                                r.center(),
+                                egui::Align2::CENTER_CENTER,
+                                "G",
+                                legend_font(20.0),
+                                ETCH,
+                            );
+                        }
+                    }
+                    ui.vertical(|ui| {
+                        ui.set_width((ui.available_width() - 340.0).max(160.0));
+                        Line::new().value(&job.name).size(14.0).elided(ui);
+                        Line::new().note(job_summary(&job.meta)).size(10.5).elided(ui);
+                        let missing = !job.path.exists();
+                        Line::new()
+                            .note(if missing {
+                                format!("missing: {}", job.path.display())
+                            } else {
+                                job.path.display().to_string()
+                            })
+                            .tint(if missing { FAULT } else { LEGEND })
+                            .size(10.0)
+                            .elided(ui);
+                    });
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui.add(Key::new("remove").outline(FAULT)).clicked() {
+                            acts.push(Act::Drop(job.id));
+                        }
+                        if ui
+                            .add(Key::new("↓").outline(VALUE).enabled(n + 1 < jobs.len()))
+                            .clicked()
+                        {
+                            acts.push(Act::Shift(job.id, 1));
+                        }
+                        if ui.add(Key::new("↑").outline(VALUE).enabled(n > 0)).clicked() {
+                            acts.push(Act::Shift(job.id, -1));
+                        }
+                        ui.allocate_ui(Vec2::new(150.0, 24.0), |ui| {
+                            let mut pick = job.printer.clone();
+                            if choice(ui, ("assign", job.id), &mut pick, printers.clone()) {
+                                acts.push(Act::Assign(job.id, pick));
+                            }
+                        });
+                    });
+                });
+            }
+        });
+    }
+
+    fn history_tab(&mut self, ui: &mut Ui, acts: &mut Vec<Act>) {
+        let done: Vec<&Record> =
+            self.history.iter().filter(|r| r.outcome == Outcome::Done).collect();
+        let hours = done.iter().map(|r| r.seconds()).sum::<u64>() as f64 / 3600.0;
+        let grams = done.iter().filter_map(|r| r.filament_g).fold(0.0, |a, g| a + g);
+        let failed = self.history.iter().filter(|r| r.outcome == Outcome::Failed).count();
+        section(ui, "history", "right click a print to queue it again", |ui| {
+            readouts(
+                ui,
+                &[
+                    ("printed", done.len().to_string(), VALUE),
+                    ("hours", format!("{hours:.1}"), VALUE),
+                    (
+                        "filament",
+                        if grams < 1000.0 {
+                            format!("{grams:.0} g")
+                        } else {
+                            format!("{:.2} kg", grams / 1000.0)
+                        },
+                        VALUE,
+                    ),
+                    ("failed", failed.to_string(), if failed > 0 { FAULT } else { VALUE }),
+                ],
+            );
+            if self.history.is_empty() {
+                note(ui, "Finished, cancelled and failed prints are listed here.", LEGEND);
+                return;
+            }
+            let rest = (ui.available_width() - 670.0).max(160.0);
+            let cols = [
+                ("ended", 110.0),
+                ("printer", 140.0),
+                ("job", 260.0),
+                ("time", 80.0),
+                ("filament", 80.0),
+                ("outcome", rest),
+            ];
+            let head =
+                ui.allocate_exact_size(Vec2::new(ui.available_width(), ROW_H), Sense::hover()).0;
+            egui_bench::table::header(ui.painter(), head, &cols);
+            let n = self.history.len();
+            egui::ScrollArea::vertical().auto_shrink([false, true]).show_rows(
+                ui,
+                ROW_H,
+                n,
+                |ui, range| {
+                    for k in range {
+                        let i = n - 1 - k;
+                        let r = &self.history[i];
+                        let (row, resp) = ui.allocate_exact_size(
+                            Vec2::new(ui.available_width(), ROW_H),
+                            Sense::click(),
+                        );
+                        let p = ui.painter_at(row);
+                        if resp.hovered() {
+                            p.rect_filled(row, 0.0, BAND);
+                        } else if k % 2 == 1 {
+                            p.rect_filled(row, 0.0, WELL.gamma_multiply(0.6));
+                        }
+                        let mut x = row.left() + 6.0;
+                        let tint = match r.outcome {
+                            Outcome::Done => OK,
+                            Outcome::Cancelled => WARN,
+                            Outcome::Failed => FAULT,
+                        };
+                        let outcome = if r.reason.is_empty() || r.outcome == Outcome::Cancelled {
+                            r.outcome.label().to_string()
+                        } else {
+                            format!("{}: {}", r.outcome.label(), r.reason)
+                        };
+                        let fields = [
+                            (when(r.ended), VALUE),
+                            (r.printer.clone(), VALUE),
+                            (r.job.clone(), VALUE),
+                            (
+                                if r.seconds() == 0 {
+                                    "-".into()
+                                } else {
+                                    hms(Duration::from_secs(r.seconds()))
+                                },
+                                VALUE,
+                            ),
+                            (r.filament_g.map(|g| format!("{g:.1} g")).unwrap_or_default(), VALUE),
+                            (outcome, tint),
+                        ];
+                        for ((text, col), (_, w)) in fields.iter().zip(cols) {
+                            cell(&p, row, x, w, text, *col);
+                            x += w;
+                        }
+                        let path = r.path.clone();
+                        resp.context_menu(|ui| {
+                            if ui
+                                .add_enabled(
+                                    path.exists(),
+                                    egui::Button::new(action("Queue again")),
+                                )
+                                .clicked()
+                            {
+                                acts.push(Act::Again(i));
+                                ui.close();
+                            }
+                        });
+                    }
+                },
+            );
+        });
+    }
+
+    fn editor(&mut self, ctx: &egui::Context) {
+        let Some(ed) = self.editor.as_mut() else { return };
+        if let Some(rx) = &ed.detecting
+            && let Ok(r) = rx.try_recv()
+        {
+            ed.detecting = None;
+            ed.found = Some(match r {
+                Ok(d) => {
+                    ed.baud = d.baud;
+                    if ed.name.trim().is_empty()
+                        && let Some(m) = &d.machine
+                    {
+                        ed.name = m.clone();
+                    }
+                    let what = d.firmware.or(d.machine).unwrap_or_else(|| "a printer".into());
+                    (true, format!("{what} answered at {} baud", d.baud))
+                }
+                Err(e) => (false, e),
+            });
+        }
+        let mut save = false;
+        let mut close = false;
+        let modal = egui::Modal::new(Id::new("printer editor")).show(ctx, |ui| {
+            ui.set_width(460.0);
+            modal_title(ui, if ed.index.is_some() { "Edit printer" } else { "Add a printer" });
+            row(ui, "name", |ui| {
+                field(ui, &mut ed.name, "Ender-3 Pro");
+            });
+            row_help(ui, "connection", "Marlin over USB streams the print from this computer, so it stops if printfarm is closed.", |ui| {
+                let mut kind = 0;
+                choice(ui, "kind", &mut kind, [(0, "Marlin over USB".to_string())]);
+            });
+            row(ui, "port", |ui| {
+                let mut options: Vec<(String, String)> = ed.ports.iter().map(|p| (p.path.clone(), p.label.clone())).collect();
+                if !ed.port.is_empty() && !options.iter().any(|(p, _)| *p == ed.port) {
+                    options.push((ed.port.clone(), ed.port.clone()));
+                }
+                if options.is_empty() {
+                    Line::new().note("no serial ports found").show(ui);
+                } else {
+                    choice(ui, "port", &mut ed.port, options);
+                }
+            });
+            row(ui, "", |ui| {
+                field(ui, &mut ed.port, "/dev/ttyUSB0");
+            });
+            row(ui, "speed", |ui| {
+                ui.horizontal(|ui| {
+                    ui.allocate_ui(Vec2::new(140.0, 24.0), |ui| {
+                        choice(ui, "baud", &mut ed.baud, BAUDS.map(|b| (b, format!("{b} baud"))));
+                    });
+                    let busy = ed.detecting.is_some();
+                    if ui.add(Key::new(if busy { "detecting…" } else { "detect" }).outline(READOUT).enabled(!busy && !ed.port.is_empty())).clicked() {
+                        let (tx, rx) = channel();
+                        let port = ed.port.clone();
+                        let c = ui.ctx().clone();
+                        std::thread::spawn(move || {
+                            let _ = tx.send(marlin::detect(&port));
+                            c.request_repaint();
+                        });
+                        ed.detecting = Some(rx);
+                        ed.found = None;
+                    }
+                });
+            });
+            if let Some((ok, text)) = &ed.found {
+                status(ui, *ok, text);
+            }
+            row_help(ui, "camera", "A snapshot or MJPEG stream URL, such as http://printer.local/webcam/?action=stream. Leave it empty for none.", |ui| {
+                field(ui, &mut ed.camera, "http://…/snapshot.jpg");
+            });
+            footer(ui, |ui| {
+                let ready = !ed.name.trim().is_empty() && !ed.port.trim().is_empty() && ed.detecting.is_none();
+                if ui.add(Key::new("save").solid(READOUT).enabled(ready).min_width(100.0)).clicked() {
+                    save = true;
+                }
+                if ui.add(Key::new("cancel").outline(VALUE).min_width(100.0)).clicked() {
+                    close = true;
+                }
+            });
+        });
+        if modal.should_close() {
+            close = true;
+        }
+        if save {
+            let ed = self.editor.take().unwrap();
+            let link = Link::MarlinUsb { port: ed.port.trim().to_string(), baud: ed.baud };
+            let camera = Some(ed.camera.trim().to_string()).filter(|c| !c.is_empty());
+            let name = ed.name.trim().to_string();
+            match ed.index {
+                Some(i) => {
+                    let p = &mut self.config.printers[i];
+                    p.name = name;
+                    p.link = link;
+                    p.camera = camera;
+                    let p = p.clone();
+                    self.stations[i] = Station::spawn(p, self.events_tx.clone(), self.wake.clone());
+                }
+                None => {
+                    let id = self.config.fresh_id(&name);
+                    let p = PrinterConfig { id, name, link, camera };
+                    self.stations.push(Station::spawn(
+                        p.clone(),
+                        self.events_tx.clone(),
+                        self.wake.clone(),
+                    ));
+                    self.config.printers.push(p);
+                }
+            }
+            self.save_config();
+            self.sync_cameras();
+        } else if close {
+            self.editor = None;
+        }
+    }
+
+    fn confirmations(&mut self, ctx: &egui::Context) {
+        if let Some(i) = self.removing {
+            let name = self.config.printers[i].name.clone();
+            let mut done = false;
+            let m = egui::Modal::new(Id::new("remove")).show(ctx, |ui| {
+                ui.set_width(380.0);
+                modal_title(ui, &format!("Remove {name}?"));
+                note(ui, "Its queued jobs go back to any printer. History is kept.", LEGEND);
+                footer(ui, |ui| {
+                    if ui.add(Key::new("remove").solid(FAULT).min_width(100.0)).clicked() {
+                        let id = self.config.printers.remove(i).id;
+                        self.stations.remove(i);
+                        for j in
+                            self.queue.jobs.iter_mut().filter(|j| j.printer.as_deref() == Some(&id))
+                        {
+                            j.printer = None;
+                        }
+                        self.queue.unclear.remove(&id);
+                        done = true;
+                    }
+                    if ui.add(Key::new("keep it").outline(VALUE).min_width(100.0)).clicked() {
+                        self.removing = None;
+                    }
+                });
+            });
+            if done {
+                self.removing = None;
+                self.save_config();
+                self.save_queue();
+                self.sync_cameras();
+            } else if m.should_close() {
+                self.removing = None;
+            }
+        }
+        if let Some(i) = self.cancelling {
+            let name = self.config.printers[i].name.clone();
+            let job = self.stations[i].status().progress.map(|p| p.job.name).unwrap_or_default();
+            let m = egui::Modal::new(Id::new("cancel")).show(ctx, |ui| {
+                ui.set_width(380.0);
+                modal_title(ui, &format!("Cancel {job}?"));
+                note(ui, format!("{name} stops, and its heaters and fan are turned off."), LEGEND);
+                footer(ui, |ui| {
+                    if ui.add(Key::new("cancel print").solid(FAULT).min_width(120.0)).clicked() {
+                        self.stations[i].send(Control::Cancel);
+                        self.cancelling = None;
+                    }
+                    if ui.add(Key::new("keep printing").outline(VALUE).min_width(120.0)).clicked() {
+                        self.cancelling = None;
+                    }
+                });
+            });
+            if m.should_close() {
+                self.cancelling = None;
+            }
+        }
+        if self.closing {
+            let busy = self.busy();
+            let m = egui::Modal::new(Id::new("closing")).show(ctx, |ui| {
+                ui.set_width(400.0);
+                modal_title(ui, "A print is running");
+                note(
+                    ui,
+                    format!(
+                        "{} is printing from this computer over USB. Closing printfarm cancels the print and turns the heaters off.",
+                        busy.join(", ")
+                    ),
+                    WARN,
+                );
+                footer(ui, |ui| {
+                    if ui.add(Key::new("cancel and close").solid(FAULT).min_width(140.0)).clicked() {
+                        self.closing = false;
+                        self.quitting = true;
+                        for s in &self.stations {
+                            if s.status().state().busy() {
+                                s.send(Control::Cancel);
+                            }
+                        }
+                    }
+                    if ui.add(Key::new("keep printing").outline(VALUE).min_width(120.0)).clicked() {
+                        self.closing = false;
+                    }
+                });
+            });
+            if m.should_close() {
+                self.closing = false;
+            }
+        }
+    }
+
+    fn console_window(&mut self, ctx: &egui::Context, acts: &mut Vec<Act>) {
+        let Some(id) = self.console.clone() else { return };
+        let Some(i) = self.config.printers.iter().position(|p| p.id == id) else {
+            self.console = None;
+            return;
+        };
+        let mut open = true;
+        let shared = self.stations[i].shared.clone();
+        egui::Window::new(format!("{} console", self.config.printers[i].name))
+            .id(Id::new(("console", &id)))
+            .open(&mut open)
+            .default_size([560.0, 380.0])
+            .show(ctx, |ui| {
+                let mut send = false;
+                ui.horizontal(|ui| {
+                    let w = ui.available_width() - 80.0;
+                    let r = ui.add_sized(
+                        [w, 24.0],
+                        egui::TextEdit::singleline(&mut self.console_line)
+                            .hint_text("G-code, such as M503")
+                            .font(FontId::monospace(13.0)),
+                    );
+                    if r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                        send = true;
+                        r.request_focus();
+                    }
+                    if ui.add(Key::new("send").outline(READOUT)).clicked() {
+                        send = true;
+                    }
+                });
+                if send && !self.console_line.trim().is_empty() {
+                    acts.push(Act::Gcode(i, std::mem::take(&mut self.console_line)));
+                }
+                ui.add_space(4.0);
+                egui::ScrollArea::vertical()
+                    .stick_to_bottom(true)
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Wrap);
+                        let Ok(s) = shared.lock() else { return };
+                        for (dir, text) in &s.console {
+                            let (prefix, col) = match dir {
+                                Dir::Sent => ("> ", READOUT),
+                                Dir::Received => ("  ", VALUE),
+                                Dir::Note => ("# ", LEGEND),
+                            };
+                            ui.label(
+                                egui::RichText::new(format!("{prefix}{text}"))
+                                    .font(mono(12.0))
+                                    .color(col),
+                            );
+                        }
+                    });
+            });
+        if !open {
+            self.console = None;
+        }
+    }
+
+    fn big_camera_window(&mut self, ctx: &egui::Context) {
+        let Some(id) = self.big_camera.clone() else { return };
+        let (frame, _) = self.camera_texture(ctx, &id);
+        let Some((tex, size)) = frame else {
+            self.big_camera = None;
+            return;
+        };
+        let mut open = true;
+        egui::Window::new(format!("{} camera", self.printer_name(&id)))
+            .id(Id::new(("camera", &id)))
+            .open(&mut open)
+            .default_size([size.x.min(960.0), size.y.min(720.0)])
+            .show(ctx, |ui| {
+                let avail = ui.available_size();
+                let scale = (avail.x / size.x).min(avail.y / size.y).max(0.1);
+                ui.add(egui::Image::new((tex, size * scale)));
+            });
+        if !open {
+            self.big_camera = None;
+        }
+    }
+
+    fn files(&mut self, ctx: &egui::Context) {
+        if let Some((b, printer)) = &mut self.browser {
+            match b.show(ctx) {
+                Picked::Browsing => {}
+                Picked::Cancelled | Picked::Folder(_) => self.browser = None,
+                Picked::File(p) => {
+                    let printer = printer.clone();
+                    self.browser = None;
+                    self.enqueue(&p, printer);
+                }
+            }
+        }
+        let dropped: Vec<PathBuf> =
+            ctx.input(|i| i.raw.dropped_files.iter().filter_map(|f| f.path.clone()).collect());
+        for p in dropped {
+            self.enqueue(&p, None);
+        }
+        if let Some(hovered) = egui_bench::drop::hovering(ctx) {
+            let paths: Vec<PathBuf> = hovered.into_iter().flatten().collect();
+            let good = paths.iter().filter(|p| gcode::is_gcode(p)).count();
+            let (head, tint) = match (paths.len(), good) {
+                (0, _) => ("Drop to queue".to_string(), READOUT),
+                (1, 1) => (
+                    format!("Queue {}", paths[0].file_name().unwrap_or_default().to_string_lossy()),
+                    READOUT,
+                ),
+                (_, 0) => ("Only G-code files can be queued".to_string(), FAULT),
+                (_, n) => (format!("Queue {n} files"), READOUT),
+            };
+            egui_bench::drop::overlay(
+                ctx,
+                None,
+                &head,
+                "Each one goes to the end of the queue, for any printer",
+                tint,
+            );
+        }
+    }
+}
+
+impl eframe::App for App {
+    fn ui(&mut self, ui: &mut Ui, _frame: &mut eframe::Frame) {
+        let ctx = ui.ctx().clone();
+        self.events();
+        if self.quitting && self.busy().is_empty() {
+            self.events();
+            self.stations.clear();
+            self.events();
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+        }
+        if ctx.input(|i| i.viewport().close_requested())
+            && !self.busy().is_empty()
+            && !self.closing
+            && !self.quitting
+        {
+            self.closing = true;
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+        }
+        let mut acts = Vec::new();
+        egui::Panel::top("header")
+            .frame(egui::Frame::NONE.fill(CHASSIS).inner_margin(egui::Margin {
+                left: 12,
+                right: 12,
+                top: 8,
+                bottom: 6,
+            }))
+            .show(ui, |ui| self.header(ui, &mut acts));
+        if let Some((ok, text)) = self.notice.clone() {
+            egui::Panel::bottom("notice")
+                .frame(egui::Frame::NONE.fill(CHASSIS).inner_margin(egui::Margin::symmetric(12, 4)))
+                .show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        status(ui, ok, &text);
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if ui.small_button("x").clicked() {
+                                self.notice = None;
+                            }
+                        });
+                    });
+                });
+        }
+        egui::CentralPanel::no_frame().show(ui, |ui| {
+            let r = ui.max_rect();
+            ui.painter().rect_filled(r, 0.0, CHASSIS);
+            ui.painter().line_segment([r.left_top(), r.right_top()], Stroke::new(1.0, ETCH));
+            egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+                egui::Frame::NONE.inner_margin(egui::Margin::same(10)).show(ui, |ui| {
+                    match self.tab {
+                        Tab::Printers => self.printers(ui, &mut acts),
+                        Tab::Queue => self.queue_tab(ui, &mut acts),
+                        Tab::History => self.history_tab(ui, &mut acts),
+                    }
+                });
+            });
+        });
+        self.console_window(&ctx, &mut acts);
+        self.big_camera_window(&ctx);
+        self.apply(acts);
+        self.editor(&ctx);
+        self.confirmations(&ctx);
+        self.files(&ctx);
+        if !self.busy().is_empty() {
+            ctx.request_repaint_after(Duration::from_secs(1));
+        }
+    }
+}
+
+fn state_tint(state: State) -> Color32 {
+    match state {
+        State::Offline => LEGEND,
+        State::Connecting => WARN,
+        State::Idle => OK,
+        State::Printing => TRACE,
+        State::Paused => WARN,
+        State::Fault => FAULT,
+    }
+}
+
+fn heater_series(
+    samples: &std::collections::VecDeque<crate::station::Sample>,
+) -> HashMap<String, Vec<f32>> {
+    let mut out: HashMap<String, Vec<f32>> = HashMap::new();
+    for s in samples {
+        for (name, actual, _) in &s.heaters {
+            out.entry(name.clone()).or_default().push(*actual);
+        }
+    }
+    out
+}
+
+pub fn hms(d: Duration) -> String {
+    let s = d.as_secs();
+    let (h, m, s) = (s / 3600, s / 60 % 60, s % 60);
+    if h > 0 {
+        format!("{h}h {m:02}m")
+    } else if m > 0 {
+        format!("{m}m {s:02}s")
+    } else {
+        format!("{s}s")
+    }
+}
+
+fn when(unix: u64) -> String {
+    use chrono::TimeZone;
+    chrono::Local
+        .timestamp_opt(unix as i64, 0)
+        .single()
+        .map(|t| t.format("%d %b %H:%M").to_string())
+        .unwrap_or_default()
+}
+
+fn job_summary(meta: &gcode::Meta) -> String {
+    let mut parts = Vec::new();
+    if let Some(e) = meta.estimate() {
+        parts.push(hms(e));
+    }
+    if let Some(g) = meta.filament_g {
+        parts.push(format!("{g:.1} g"));
+    }
+    if meta.layers > 0 {
+        parts.push(format!("{} layers", meta.layers));
+    }
+    if let Some(s) = &meta.slicer {
+        parts.push(s.clone());
+    }
+    if parts.is_empty() {
+        parts.push(format!("{} commands", meta.commands));
+    }
+    parts.join(", ")
+}
+
+pub fn run(open: Vec<PathBuf>) -> eframe::Result<()> {
+    let icon = eframe::icon_data::from_png_bytes(include_bytes!("../assets/icon-256.png")).ok();
+    let mut viewport = egui::ViewportBuilder::default()
+        .with_inner_size([1280.0, 860.0])
+        .with_title("printfarm")
+        .with_app_id("printfarm");
+    if let Some(icon) = icon {
+        viewport = viewport.with_icon(Arc::new(icon));
+    }
+    let opts = eframe::NativeOptions { viewport, ..Default::default() };
+    eframe::run_native(
+        "printfarm",
+        opts,
+        Box::new(move |cc| Ok(Box::new(App::new(&cc.egui_ctx, open)))),
+    )
+}

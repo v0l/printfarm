@@ -1,0 +1,15 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" width="64" height="64" role="img" aria-labelledby="t d">
+  <title id="t">printfarm</title>
+  <desc id="d">A printer frame with its hot end laying the top layer of a part, two more frames behind it.</desc>
+  <rect width="64" height="64" rx="14" fill="#0B1014"/>
+  <g fill="none" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M17 13H51M17 13V18M51 13V18" stroke="#2FD3E1" stroke-width="2.4" opacity=".3"/>
+    <path d="M13 17H47M13 17V22M47 17V22" stroke="#2FD3E1" stroke-width="2.4" opacity=".5"/>
+    <path d="M9 52V21H55V52M5 52H59" stroke="#2FD3E1" stroke-width="3"/>
+    <path d="M22 47H42M22 42H42M24 37H40" stroke="#2FD3E1" stroke-width="3" opacity=".6"/>
+    <path d="M14 27H50" stroke="#2FD3E1" stroke-width="2.6"/>
+    <path d="M33 23H43V31H33Z" stroke="#FFB020" stroke-width="3"/>
+    <path d="M36 31 38 34 40 31" stroke="#FFB020" stroke-width="2.6"/>
+    <path d="M25 37H38" stroke="#FFB020" stroke-width="3"/>
+  </g>
+</svg>
