@@ -427,9 +427,17 @@ impl App {
         }
         let state = status.state();
         let tint = state_tint(state);
-        let unclear = self.queue.unclear.contains(&config.id);
-        let next = self.queue.next_for(&config.id).cloned();
+        let card_data = CardData {
+            i,
+            config: config.clone(),
+            status,
+            samples,
+            unclear: self.queue.unclear.contains(&config.id),
+            next: self.queue.next_for(&config.id).cloned(),
+            now,
+        };
         let (frame, cam_error) = self.camera_texture(ui.ctx(), &config.id);
+        let has_camera = config.camera.is_some();
         card(
             ui,
             Some(tint),
@@ -440,204 +448,35 @@ impl App {
                 });
             },
             |ui| {
-                if let Some((tex, size)) = frame {
-                    let room = Vec2::new(
-                        ui.available_width(),
-                        (ui.available_width() * 9.0 / 16.0).min(240.0),
-                    );
-                    let scale = (room.x / size.x).min(room.y / size.y);
-                    let r = ui
-                        .vertical_centered(|ui| {
-                            ui.add(egui::Image::new((tex, size * scale)).sense(Sense::click()))
-                        })
-                        .inner;
-                    if r.on_hover_text("open the camera").clicked() {
-                        acts.push(Act::Camera(i));
-                    }
-                } else if config.camera.is_some() {
-                    note(ui, cam_error.as_deref().unwrap_or("waiting for the camera"), LEGEND);
-                }
-                let what = [status.machine.clone(), status.firmware.clone()]
-                    .into_iter()
-                    .flatten()
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                Line::new()
-                    .note(if what.is_empty() { config.link.summary() } else { what })
-                    .size(10.5)
-                    .elided(ui);
-                ui.add_space(2.0);
-                match state {
-                    State::Offline | State::Connecting => {
-                        note(
-                            ui,
-                            &status.detail,
-                            if state == State::Offline { WARN } else { LEGEND },
+                let mut opened = false;
+                if has_camera && ui.available_width() >= SIDE_CAMERA_W {
+                    ui.horizontal_top(|ui| {
+                        let cam_w = (ui.available_width() * 0.45).min(480.0);
+                        let info_w = ui.available_width() - cam_w - 12.0;
+                        ui.allocate_ui_with_layout(
+                            Vec2::new(info_w, 0.0),
+                            egui::Layout::top_down(egui::Align::Min),
+                            |ui| printer_info(ui, &card_data, acts),
                         );
-                    }
-                    State::Fault => {
-                        note(ui, &status.detail, FAULT);
                         ui.add_space(4.0);
-                        if ui.add(Key::new("reconnect").outline(VALUE)).clicked() {
-                            acts.push(Act::Reconnect(i));
-                        }
-                    }
-                    State::Printing | State::Paused => {
-                        if let Some(p) = &status.progress {
-                            let pct = format!("{:.1}", p.fraction() * 100.0);
-                            hero(
-                                ui,
-                                &p.job.name,
-                                &pct,
-                                "%",
-                                if state == State::Paused { WARN } else { TRACE },
-                            );
-                            let r = ui
-                                .allocate_exact_size(
-                                    Vec2::new(ui.available_width(), 8.0),
-                                    Sense::hover(),
-                                )
-                                .0;
-                            bar(
-                                ui.painter(),
-                                r,
-                                p.fraction(),
-                                if state == State::Paused { WARN } else { TRACE },
-                            );
-                            ui.add_space(4.0);
-                            let layers = if p.job.meta.layers > 0 {
-                                format!("{} / {}", p.layer, p.job.meta.layers)
-                            } else {
-                                p.layer.to_string()
-                            };
-                            readouts(
-                                ui,
-                                &[
-                                    ("elapsed", hms(p.elapsed(now)), VALUE),
-                                    (
-                                        "left",
-                                        p.remaining(now).map(hms).unwrap_or("-".into()),
-                                        VALUE,
-                                    ),
-                                    ("layer", layers, VALUE),
-                                ],
-                            );
-                            if let Some(a) = status.activity {
-                                Line::new().legend("now").value(a).elided(ui);
-                            }
-                            if let Some(m) = &status.message {
-                                Line::new().legend("says").value(m).elided(ui);
-                            }
-                        }
-                        ui.horizontal(|ui| {
-                            let (label, act) = if state == State::Paused {
-                                ("resume", Act::Resume(i))
-                            } else {
-                                ("pause", Act::Pause(i))
-                            };
-                            if ui.add(Key::new(label).solid(READOUT).min_width(100.0)).clicked() {
-                                acts.push(act);
-                            }
-                            if ui.add(Key::new("cancel").outline(FAULT).min_width(100.0)).clicked()
-                            {
-                                acts.push(Act::Cancel(i));
-                            }
-                        });
-                    }
-                    State::Idle => {
-                        if unclear {
-                            note(
-                                ui,
-                                "The last print may still be on the bed. Clear it before the next one starts.",
-                                WARN,
-                            );
-                            ui.add_space(4.0);
-                            if ui.add(Key::new("bed is clear").solid(OK).min_width(140.0)).clicked()
-                            {
-                                acts.push(Act::BedClear(i));
-                            }
-                        } else if let Some(job) = &next {
-                            Line::new().legend("next").value(&job.name).elided(ui);
-                            Line::new().note(job_summary(&job.meta)).size(10.5).elided(ui);
-                            ui.add_space(4.0);
-                            if ui.add(Key::new("start").solid(READOUT).min_width(140.0)).clicked() {
-                                acts.push(Act::Start(i, job.id));
-                            }
-                        } else {
-                            note(
-                                ui,
-                                "Nothing queued for this printer. Drop a G-code file on the window to queue it.",
-                                LEGEND,
-                            );
-                        }
-                    }
-                }
-                if !status.heaters.is_empty() {
-                    ui.add_space(6.0);
-                    for h in &status.heaters {
-                        let mut line = Line::new()
-                            .legend(&h.name)
-                            .column(ui, 70.0)
-                            .measured(format!("{:.1} °C", h.actual));
-                        if h.target > 0.0 {
-                            line = line.note("  set ").set(format!("{:.0} °C", h.target));
-                        }
-                        line.show(ui);
-                        if let Some(points) = samples.get(&h.name)
-                            && points.len() > 1
-                        {
-                            let hi =
-                                points.iter().copied().fold(h.target.max(50.0), f32::max) * 1.1;
-                            let mut t = Trace::new(points)
-                                .size(Vec2::new(ui.available_width(), 26.0))
-                                .range(0.0, hi);
-                            if h.target > 0.0 {
-                                t = t.rule(h.target);
-                            }
-                            ui.add(t);
-                        }
-                    }
-                }
-                ui.add_space(6.0);
-                ui.horizontal(|ui| {
-                    let online = !matches!(state, State::Offline | State::Connecting);
-                    let heat = ui.add(Key::new("heat").outline(VALUE).enabled(online));
-                    egui::Popup::menu(&heat).width(200.0).show(|ui| {
-                        for (name, hotend, bed) in PRESETS {
-                            if ui.button(action(format!("{name}  {hotend} / {bed} °C"))).clicked()
-                            {
-                                acts.push(Act::Gcode(i, format!("M104 S{hotend}\nM140 S{bed}")));
-                            }
-                        }
-                        if ui.button(action("Cool down")).clicked() {
-                            acts.push(Act::Gcode(i, "M104 S0\nM140 S0".into()));
-                        }
+                        ui.allocate_ui_with_layout(
+                            Vec2::new(cam_w, 0.0),
+                            egui::Layout::top_down(egui::Align::Max),
+                            |ui| {
+                                opened = camera_view(ui, frame, cam_error.as_deref(), cam_w * 0.75)
+                            },
+                        );
                     });
-                    if ui.add(Key::new("console").outline(VALUE)).clicked() {
-                        acts.push(Act::Console(i));
+                } else {
+                    if has_camera {
+                        let h = (ui.available_width() * 9.0 / 16.0).min(240.0);
+                        opened = camera_view(ui, frame, cam_error.as_deref(), h);
                     }
-                    let more = ui.add(Key::more().id_salt(("more", i)));
-                    egui::Popup::menu(&more).width(200.0).show(|ui| {
-                        if ui.button(action("Queue a file for this printer…")).clicked() {
-                            acts.push(Act::Pick(Some(config.id.clone())));
-                        }
-                        if ui
-                            .add_enabled(!state.busy(), egui::Button::new(action("Edit")))
-                            .clicked()
-                        {
-                            acts.push(Act::Edit(Some(i)));
-                        }
-                        if ui.button(action("Reconnect")).clicked() {
-                            acts.push(Act::Reconnect(i));
-                        }
-                        if ui
-                            .add_enabled(!state.busy(), egui::Button::new(action("Remove")))
-                            .clicked()
-                        {
-                            acts.push(Act::Remove(i));
-                        }
-                    });
-                });
+                    printer_info(ui, &card_data, acts);
+                }
+                if opened {
+                    acts.push(Act::Camera(i));
+                }
             },
         );
     }
@@ -1241,6 +1080,208 @@ impl eframe::App for App {
             ctx.request_repaint_after(Duration::from_secs(1));
         }
     }
+}
+
+const SIDE_CAMERA_W: f32 = 560.0;
+
+struct CardData {
+    i: usize,
+    config: PrinterConfig,
+    status: crate::printer::Status,
+    samples: HashMap<String, Vec<f32>>,
+    unclear: bool,
+    next: Option<crate::printer::Job>,
+    now: SystemTime,
+}
+
+fn camera_view(
+    ui: &mut Ui,
+    frame: Option<(egui::TextureId, Vec2)>,
+    error: Option<&str>,
+    max_h: f32,
+) -> bool {
+    let Some((tex, size)) = frame else {
+        note(ui, error.unwrap_or("waiting for the camera"), LEGEND);
+        return false;
+    };
+    let scale = (ui.available_width() / size.x).min(max_h / size.y);
+    ui.add(egui::Image::new((tex, size * scale)).sense(Sense::click()))
+        .on_hover_text("open the camera")
+        .clicked()
+}
+
+fn heater_line(ui: &mut Ui, status: &crate::printer::Status, samples: &HashMap<String, Vec<f32>>) {
+    if status.heaters.is_empty() {
+        return;
+    }
+    ui.add_space(6.0);
+    let mut line = Line::new();
+    for (n, h) in status.heaters.iter().enumerate() {
+        if n > 0 {
+            line = line.gap(18.0);
+        }
+        line = line.legend(&h.name).measured(format!("{:.1} °C", h.actual));
+        if h.target > 0.0 {
+            line = line.note(" / ").set(format!("{:.0}", h.target));
+        }
+    }
+    line.show(ui);
+    let traced: Vec<_> = status
+        .heaters
+        .iter()
+        .filter_map(|h| samples.get(&h.name).filter(|p| p.len() > 1).map(|p| (h, p)))
+        .collect();
+    if traced.is_empty() {
+        return;
+    }
+    ui.horizontal(|ui| {
+        let gap = 8.0;
+        let w = (ui.available_width() - gap * (traced.len() as f32 - 1.0)) / traced.len() as f32;
+        ui.spacing_mut().item_spacing.x = gap;
+        for (h, points) in traced {
+            let hi = points.iter().copied().fold(h.target.max(50.0), f32::max) * 1.1;
+            let mut t = Trace::new(points).size(Vec2::new(w, 26.0)).range(0.0, hi);
+            if h.target > 0.0 {
+                t = t.rule(h.target);
+            }
+            ui.add(t).on_hover_text(&h.name);
+        }
+    });
+}
+
+fn printer_info(ui: &mut Ui, d: &CardData, acts: &mut Vec<Act>) {
+    let (i, config, status, now) = (d.i, &d.config, &d.status, d.now);
+    let (unclear, next) = (d.unclear, &d.next);
+    let state = status.state();
+    let what = [status.machine.clone(), status.firmware.clone()]
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>()
+        .join(", ");
+    Line::new()
+        .note(if what.is_empty() { config.link.summary() } else { what })
+        .size(10.5)
+        .elided(ui);
+    ui.add_space(2.0);
+    match state {
+        State::Offline | State::Connecting => {
+            note(ui, &status.detail, if state == State::Offline { WARN } else { LEGEND });
+        }
+        State::Fault => {
+            note(ui, &status.detail, FAULT);
+            ui.add_space(4.0);
+            if ui.add(Key::new("reconnect").outline(VALUE)).clicked() {
+                acts.push(Act::Reconnect(i));
+            }
+        }
+        State::Printing | State::Paused => {
+            if let Some(p) = &status.progress {
+                let pct = format!("{:.1}", p.fraction() * 100.0);
+                hero(ui, &p.job.name, &pct, "%", if state == State::Paused { WARN } else { TRACE });
+                let r =
+                    ui.allocate_exact_size(Vec2::new(ui.available_width(), 8.0), Sense::hover()).0;
+                bar(
+                    ui.painter(),
+                    r,
+                    p.fraction(),
+                    if state == State::Paused { WARN } else { TRACE },
+                );
+                ui.add_space(4.0);
+                let layers = if p.job.meta.layers > 0 {
+                    format!("{} / {}", p.layer, p.job.meta.layers)
+                } else {
+                    p.layer.to_string()
+                };
+                readouts(
+                    ui,
+                    &[
+                        ("elapsed", hms(p.elapsed(now)), VALUE),
+                        ("left", p.remaining(now).map(hms).unwrap_or("-".into()), VALUE),
+                        ("layer", layers, VALUE),
+                    ],
+                );
+                if let Some(a) = status.activity {
+                    Line::new().legend("now").value(a).elided(ui);
+                }
+                if let Some(m) = &status.message {
+                    Line::new().legend("says").value(m).elided(ui);
+                }
+            }
+            ui.horizontal(|ui| {
+                let (label, act) = if state == State::Paused {
+                    ("resume", Act::Resume(i))
+                } else {
+                    ("pause", Act::Pause(i))
+                };
+                if ui.add(Key::new(label).solid(READOUT).min_width(100.0)).clicked() {
+                    acts.push(act);
+                }
+                if ui.add(Key::new("cancel").outline(FAULT).min_width(100.0)).clicked() {
+                    acts.push(Act::Cancel(i));
+                }
+            });
+        }
+        State::Idle => {
+            if unclear {
+                note(
+                    ui,
+                    "The last print may still be on the bed. Clear it before the next one starts.",
+                    WARN,
+                );
+                ui.add_space(4.0);
+                if ui.add(Key::new("bed is clear").solid(OK).min_width(140.0)).clicked() {
+                    acts.push(Act::BedClear(i));
+                }
+            } else if let Some(job) = &next {
+                Line::new().legend("next").value(&job.name).elided(ui);
+                Line::new().note(job_summary(&job.meta)).size(10.5).elided(ui);
+                ui.add_space(4.0);
+                if ui.add(Key::new("start").solid(READOUT).min_width(140.0)).clicked() {
+                    acts.push(Act::Start(i, job.id));
+                }
+            } else {
+                note(
+                    ui,
+                    "Nothing queued for this printer. Drop a G-code file on the window to queue it.",
+                    LEGEND,
+                );
+            }
+        }
+    }
+    heater_line(ui, status, &d.samples);
+    ui.add_space(6.0);
+    ui.horizontal(|ui| {
+        let online = !matches!(state, State::Offline | State::Connecting);
+        let heat = ui.add(Key::new("heat").outline(VALUE).enabled(online));
+        egui::Popup::menu(&heat).width(200.0).show(|ui| {
+            for (name, hotend, bed) in PRESETS {
+                if ui.button(action(format!("{name}  {hotend} / {bed} °C"))).clicked() {
+                    acts.push(Act::Gcode(i, format!("M104 S{hotend}\nM140 S{bed}")));
+                }
+            }
+            if ui.button(action("Cool down")).clicked() {
+                acts.push(Act::Gcode(i, "M104 S0\nM140 S0".into()));
+            }
+        });
+        if ui.add(Key::new("console").outline(VALUE)).clicked() {
+            acts.push(Act::Console(i));
+        }
+        let more = ui.add(Key::more().id_salt(("more", i)));
+        egui::Popup::menu(&more).width(200.0).show(|ui| {
+            if ui.button(action("Queue a file for this printer…")).clicked() {
+                acts.push(Act::Pick(Some(config.id.clone())));
+            }
+            if ui.add_enabled(!state.busy(), egui::Button::new(action("Edit"))).clicked() {
+                acts.push(Act::Edit(Some(i)));
+            }
+            if ui.button(action("Reconnect")).clicked() {
+                acts.push(Act::Reconnect(i));
+            }
+            if ui.add_enabled(!state.busy(), egui::Button::new(action("Remove"))).clicked() {
+                acts.push(Act::Remove(i));
+            }
+        });
+    });
 }
 
 fn state_tint(state: State) -> Color32 {
