@@ -2160,6 +2160,7 @@ dependencies = [
  "egui",
  "egui_bench",
  "image",
+ "libc",
  "serde",
  "serde_json",
  "serialport",

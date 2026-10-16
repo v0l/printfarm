@@ -1,5 +1,5 @@
 use super::mesh::{GridReader, Mesh, grid_title};
-use super::{Dir, Event, Heater, Job, Outcome, Printer, Progress, State, Status};
+use super::{Dir, Event, Foreign, Heater, Job, Outcome, Printer, Progress, State, Status};
 use crate::gcode;
 use serialport::SerialPort;
 use std::collections::VecDeque;
@@ -11,6 +11,8 @@ const READ_TIMEOUT: Duration = Duration::from_millis(20);
 const PROBE_EVERY: Duration = Duration::from_secs(2);
 const PROBE_TRIES: u32 = 4;
 const POLL_EVERY: Duration = Duration::from_secs(2);
+const SD_POLL_BUSY: Duration = Duration::from_secs(3);
+const SD_POLL_IDLE: Duration = Duration::from_secs(10);
 const QUIET_POLL: Duration = Duration::from_secs(10);
 const POKE_AFTER: Duration = Duration::from_secs(15);
 const RETRY_AFTER: Duration = Duration::from_secs(3);
@@ -19,17 +21,23 @@ const KEEP_SENT: usize = 64;
 
 pub const BAUDS: [u32; 7] = [115200, 250000, 1000000, 500000, 230400, 57600, 2000000];
 
+pub fn sd_name(job: u64) -> String {
+    format!("PF{:06}.GCO", job % 1_000_000)
+}
+
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Kind {
     Setup,
     Manual,
     Poll,
-    Job,
-    Final,
+    Open,
+    Upload,
+    Close,
 }
 
 enum Queued {
     Plain(String),
+    Kinded(String, Kind),
     Resync,
 }
 
@@ -38,10 +46,25 @@ enum Handshake {
     Ready,
 }
 
+enum Phase {
+    Opening(BufReader<File>),
+    Sending(BufReader<File>),
+    Closing,
+    OnPrinter,
+}
+
 struct Running {
     progress: Progress,
-    reader: BufReader<File>,
-    draining: bool,
+    file: String,
+    phase: Phase,
+    layers: Vec<u64>,
+    bytes: u64,
+}
+
+impl Running {
+    fn uploading(&self) -> bool {
+        !matches!(self.phase, Phase::OnPrinter)
+    }
 }
 
 pub struct Marlin {
@@ -57,10 +80,17 @@ pub struct Marlin {
     resend: VecDeque<(u32, String, Kind)>,
     resend_from: Option<u32>,
     manual: VecDeque<Queued>,
+    polls: VecDeque<&'static str>,
     job: Option<Running>,
     autoreport: bool,
+    sd_cap: Option<bool>,
+    sd_file: Option<Option<String>>,
+    away: bool,
+    cleanup: Vec<String>,
     last_rx: Instant,
+    attached_at: Instant,
     last_poll: Instant,
+    last_sd_poll: Instant,
     retry_at: Instant,
     poked: bool,
     pending: Vec<Event>,
@@ -83,10 +113,17 @@ impl Marlin {
             resend: VecDeque::new(),
             resend_from: None,
             manual: VecDeque::new(),
+            polls: VecDeque::new(),
             job: None,
             autoreport: false,
+            sd_cap: None,
+            sd_file: None,
+            away: false,
+            cleanup: Vec::new(),
             last_rx: now,
+            attached_at: now,
             last_poll: now,
+            last_sd_poll: now,
             retry_at: now,
             poked: false,
             pending: Vec::new(),
@@ -110,8 +147,12 @@ impl Marlin {
         self.resend.clear();
         self.resend_from = None;
         self.manual.clear();
+        self.polls.clear();
         self.autoreport = false;
+        self.sd_cap = None;
+        self.sd_file = None;
         self.last_rx = now;
+        self.attached_at = now;
         self.last_poll = now;
         self.poked = false;
         self.status.state = Some(State::Connecting);
@@ -119,6 +160,7 @@ impl Marlin {
         self.status.heaters.clear();
         self.status.leveling = Default::default();
         self.status.activity = None;
+        self.status.foreign = None;
         self.grid = None;
     }
 
@@ -146,10 +188,16 @@ impl Marlin {
 
     fn lost(&mut self, why: String, events: &mut Vec<Event>) {
         self.link = None;
-        self.end_job(Outcome::Failed, &why, events);
+        if self.job.as_ref().is_some_and(Running::uploading) {
+            self.interrupt("the printer went away while it was being sent", events);
+        }
+        if self.job.is_some() {
+            self.away = true;
+        }
         self.status.state = Some(State::Offline);
         self.status.detail = why;
         self.status.heaters.clear();
+        self.status.foreign = None;
         self.retry_at = Instant::now() + RETRY_AFTER;
     }
 
@@ -176,7 +224,7 @@ impl Marlin {
                 self.sent.pop_front();
             }
             self.in_flight = Some(kind);
-            if kind != Kind::Job && kind != Kind::Poll {
+            if kind != Kind::Upload && kind != Kind::Poll {
                 events.push(Event::Console(Dir::Sent, cmd.to_string()));
             }
         }
@@ -226,6 +274,9 @@ impl Marlin {
         let reported = !temps.is_empty();
         if reported {
             self.status.heaters = temps;
+            if self.job.as_ref().is_some_and(|r| !r.uploading()) {
+                self.status.activity = line.contains(" W:").then_some("heating");
+            }
         }
         if let Some(rest) = line.strip_prefix("ok") {
             if !rest.trim().is_empty() && temperatures(rest).is_empty() {
@@ -237,7 +288,21 @@ impl Marlin {
         if line.starts_with("echo:busy") || (reported && is_report(line)) {
             return;
         }
-        events.push(Event::Console(Dir::Received, line.to_string()));
+        if self.in_flight != Some(Kind::Poll) {
+            events.push(Event::Console(Dir::Received, line.to_string()));
+        }
+        let text = line.trim_start_matches("echo:");
+        if !matches!(self.handshake, Handshake::Ready) {
+            if line.contains("FIRMWARE_NAME:") {
+                self.status.firmware = field(line, "FIRMWARE_NAME");
+                self.status.machine = field(line, "MACHINE_TYPE");
+            } else if line.starts_with("Cap:AUTOREPORT_TEMP:1") {
+                self.autoreport = true;
+            } else if let Some(v) = line.strip_prefix("Cap:SDCARD:") {
+                self.sd_cap = Some(v.trim() == "1");
+            }
+            return;
+        }
         if let Some(n) = resend_request(line) {
             self.resend_from = Some(n);
         } else if line.starts_with("Error:") || line.starts_with("!!") {
@@ -251,25 +316,125 @@ impl Marlin {
         } else if self.status.leveling.read_state(line) {
         } else if line.starts_with("Cap:AUTOREPORT_TEMP:1") {
             self.autoreport = true;
+        } else if let Some(v) = line.strip_prefix("Cap:SDCARD:") {
+            self.sd_cap = Some(v.trim() == "1");
+        } else if let Some(rest) = text.strip_prefix("Current file:") {
+            let name = rest.split_whitespace().next().unwrap_or("");
+            self.sd_file = Some((!name.is_empty() && name != "(no").then(|| name.to_string()));
+        } else if let Some(rest) = text.strip_prefix("SD printing byte") {
+            let pos = rest
+                .trim()
+                .split_once('/')
+                .and_then(|(a, b)| Some((a.trim().parse().ok()?, b.trim().parse().ok()?)));
+            self.reconcile(pos.or(Some((0, 0))), events);
+        } else if text.starts_with("Not SD printing") {
+            self.reconcile(None, events);
+        } else if text.starts_with("Done printing file") {
+            self.sd_file = Some(None);
+            self.reconcile(None, events);
+        } else if text.contains("open failed") {
+            self.open_failed(text, events);
+        } else if text.contains("No SD card")
+            || text.contains("SD init fail")
+            || text.contains("No media")
+        {
+            if self.job.as_ref().is_some_and(Running::uploading) {
+                self.manual.clear();
+                self.interrupt("there is no SD card in the printer", events);
+            }
         } else if let Some(action) = line.strip_prefix("//action:") {
             self.action(action.trim(), events);
         } else if line == "start" && matches!(self.handshake, Handshake::Ready) {
-            self.end_job(Outcome::Failed, "the printer restarted", events);
+            self.drop_job("the printer restarted", events);
             if let Some(link) = self.link.take() {
                 self.attach(link);
             }
         }
     }
 
+    fn open_failed(&mut self, text: &str, events: &mut Vec<Event>) {
+        let Some(run) = &self.job else { return };
+        if !text.to_ascii_lowercase().contains(&run.file.to_ascii_lowercase()) {
+            return;
+        }
+        match run.phase {
+            Phase::Opening(_) => {
+                self.manual.clear();
+                self.interrupt("the printer could not write the file to its SD card", events);
+            }
+            Phase::OnPrinter => self.end_job(
+                Outcome::Failed,
+                "the printer could not open the file on its SD card",
+                events,
+            ),
+            _ => {}
+        }
+    }
+
+    fn reconcile(&mut self, printing: Option<(u64, u64)>, events: &mut Vec<Event>) {
+        let current = self.sd_file.take();
+        let ours = self.job.as_ref().filter(|r| !r.uploading()).map(|r| r.file.clone());
+        if self.job.as_ref().is_some_and(Running::uploading) {
+            return;
+        }
+        let is_ours = |name: &str| ours.as_deref().is_some_and(|o| o.eq_ignore_ascii_case(name));
+        let away = std::mem::take(&mut self.away);
+        let reason = if away { "finished while printfarm was away" } else { "" };
+        match current {
+            Some(Some(name)) if is_ours(&name) => self.ours(printing),
+            None if ours.is_some() && printing.is_some() => self.ours(printing),
+            None if printing.is_none() && self.status.state() == State::Printing => {
+                self.away = away;
+                self.polls.extend(["M27 C", "M27"]);
+            }
+            None => self.away = away,
+            Some(other) => {
+                if ours.is_some() {
+                    self.end_job(Outcome::Done, reason, events);
+                }
+                self.status.foreign = other.map(|file| {
+                    let (done, total) = printing.unwrap_or_default();
+                    Foreign { file, done, total, printing: printing.is_some() }
+                });
+                self.status.state = Some(match &self.status.foreign {
+                    Some(f) if f.printing => State::Printing,
+                    Some(_) => State::Paused,
+                    None => State::Idle,
+                });
+            }
+        }
+    }
+
+    fn ours(&mut self, printing: Option<(u64, u64)>) {
+        self.status.foreign = None;
+        self.away = false;
+        let now = SystemTime::now();
+        let Some(run) = self.job.as_mut() else { return };
+        let p = &mut run.progress;
+        match printing {
+            Some((done, total)) => {
+                if total > 0 {
+                    p.done = done;
+                    p.total = total;
+                    let at = (done as f64 / total as f64 * run.bytes as f64) as u64;
+                    p.layer = gcode::layer_at(&run.layers, at);
+                }
+                if let Some(since) = p.paused_since.take() {
+                    p.paused += now.duration_since(since).unwrap_or_default();
+                }
+                self.status.state = Some(State::Printing);
+            }
+            None => {
+                p.paused_since.get_or_insert(now);
+                self.status.state = Some(State::Paused);
+            }
+        }
+        self.status.progress = Some(run.progress.clone());
+    }
+
     fn action(&mut self, action: &str, events: &mut Vec<Event>) {
         let (verb, rest) = action.split_once(' ').unwrap_or((action, ""));
         match verb {
-            "pause" | "paused" => {
-                let _ = self.pause();
-            }
-            "resume" | "resumed" => {
-                let _ = self.resume();
-            }
             "cancel" => {
                 let _ = self.cancel_with(events, "cancelled on the printer");
             }
@@ -280,19 +445,7 @@ impl Marlin {
 
     fn ack(&mut self, events: &mut Vec<Event>) {
         if let Handshake::Probing { .. } = self.handshake {
-            self.handshake = Handshake::Ready;
-            self.status.detail.clear();
-            self.next_n = 0;
-            self.send_numbered("M110 N0", Kind::Setup, events);
-            if self.autoreport {
-                self.manual.push_back(Queued::Plain("M155 S2".into()));
-            } else {
-                self.manual.push_back(Queued::Plain("M105".into()));
-            }
-            self.manual.push_back(Queued::Plain("M420 V".into()));
-            if self.status.state() == State::Connecting {
-                self.status.state = Some(State::Idle);
-            }
+            self.ready(events);
             return;
         }
         let was = self.in_flight.take();
@@ -306,24 +459,94 @@ impl Marlin {
             }
             return;
         }
-        if matches!(was, Some(Kind::Job | Kind::Manual)) {
+        if was == Some(Kind::Manual) {
             self.status.activity = None;
         }
-        if was == Some(Kind::Final) {
-            self.end_job(Outcome::Done, "", events);
+        match was {
+            Some(Kind::Open) => {
+                if let Some(run) = self.job.as_mut() {
+                    run.phase = match std::mem::replace(&mut run.phase, Phase::Closing) {
+                        Phase::Opening(reader) => Phase::Sending(reader),
+                        other => other,
+                    };
+                }
+            }
+            Some(Kind::Close) => self.on_printer(events),
+            _ => {}
         }
     }
 
+    fn ready(&mut self, events: &mut Vec<Event>) {
+        self.handshake = Handshake::Ready;
+        self.status.detail.clear();
+        self.next_n = 0;
+        self.send_numbered("M110 N0", Kind::Setup, events);
+        self.manual.push_back(Queued::Plain("M29".into()));
+        if self.autoreport {
+            self.manual.push_back(Queued::Plain("M155 S2".into()));
+        } else {
+            self.manual.push_back(Queued::Plain("M105".into()));
+        }
+        for file in std::mem::take(&mut self.cleanup) {
+            self.manual.push_back(Queued::Plain(format!("M30 {file}")));
+        }
+        self.manual.push_back(Queued::Plain("M420 V".into()));
+        if self.sd_cap != Some(false) {
+            self.polls.extend(["M27 C", "M27"]);
+            self.last_sd_poll = Instant::now();
+        }
+        self.status.state = Some(if self.job.is_some() { State::Printing } else { State::Idle });
+    }
+
+    fn on_printer(&mut self, events: &mut Vec<Event>) {
+        let Some(run) = self.job.as_mut() else { return };
+        run.phase = Phase::OnPrinter;
+        let p = &mut run.progress;
+        p.sending = false;
+        p.done = 0;
+        p.layer = 0;
+        p.started = SystemTime::now();
+        p.paused = Duration::ZERO;
+        p.paused_since = None;
+        let file = run.file.clone();
+        self.status.progress = Some(run.progress.clone());
+        self.manual.push_back(Queued::Plain(format!("M23 {file}")));
+        self.manual.push_back(Queued::Plain("M24".into()));
+        events.push(Event::OnPrinter(run.progress.job.clone()));
+    }
+
     fn fault(&mut self, why: String, events: &mut Vec<Event>) {
-        self.end_job(Outcome::Failed, &why, events);
+        self.drop_job(&why, events);
         self.manual.clear();
         self.resend.clear();
         self.status.state = Some(State::Fault);
         self.status.detail = why;
     }
 
+    fn drop_job(&mut self, why: &str, events: &mut Vec<Event>) {
+        if self.job.as_ref().is_some_and(Running::uploading) {
+            self.interrupt(why, events);
+        } else {
+            self.end_job(Outcome::Failed, why, events);
+        }
+    }
+
+    fn interrupt(&mut self, why: &str, events: &mut Vec<Event>) {
+        if let Some(run) = self.job.take() {
+            self.cleanup.push(run.file);
+            events.push(Event::Interrupted(run.progress.job, why.to_string()));
+        }
+        self.status.progress = None;
+        if self.status.state().busy() {
+            self.status.state = Some(State::Idle);
+        }
+    }
+
     fn end_job(&mut self, outcome: Outcome, reason: &str, events: &mut Vec<Event>) {
         if let Some(run) = self.job.take() {
+            if !run.uploading() {
+                self.manual.push_back(Queued::Plain(format!("M30 {}", run.file)));
+            }
             events.push(Event::Finished {
                 job: run.progress.job,
                 outcome,
@@ -338,30 +561,22 @@ impl Marlin {
         self.status.activity = None;
     }
 
-    fn next_job_line(&mut self) -> Option<(String, Kind)> {
+    fn next_upload_line(&mut self) -> Option<(String, Kind)> {
         let run = self.job.as_mut()?;
-        if run.draining {
-            return None;
-        }
+        let Phase::Sending(reader) = &mut run.phase else { return None };
         let mut line = String::new();
         loop {
             line.clear();
-            match run.reader.read_line(&mut line) {
+            match reader.read_line(&mut line) {
                 Ok(0) | Err(_) => {
-                    run.draining = true;
+                    run.phase = Phase::Closing;
                     run.progress.done = run.progress.total;
-                    return Some(("M400".into(), Kind::Final));
+                    return Some(("M29".into(), Kind::Close));
                 }
-                Ok(n) => {
-                    run.progress.done += n as u64;
-                    if gcode::is_layer_change(&line) {
-                        run.progress.layer += 1;
-                    }
+                Ok(_) => {
                     if let Some(cmd) = gcode::command(&line) {
-                        if let Some(text) = cmd.strip_prefix("M117 ") {
-                            self.status.message = Some(text.trim().to_string());
-                        }
-                        return Some((cmd.to_string(), Kind::Job));
+                        run.progress.done += cmd.len() as u64 + 1;
+                        return Some((cmd.to_string(), Kind::Upload));
                     }
                 }
             }
@@ -382,14 +597,28 @@ impl Marlin {
         if let Some(q) = self.manual.pop_front() {
             match q {
                 Queued::Plain(cmd) => {
-                    self.status.activity = activity(&cmd);
+                    self.status.activity = activity(&cmd).or(self.status.activity);
                     self.send_numbered(&cmd, Kind::Manual, events);
                 }
+                Queued::Kinded(cmd, kind) => self.send_numbered(&cmd, kind, events),
                 Queued::Resync => {
                     let n = self.next_n;
                     self.send_numbered(&format!("M110 N{n}"), Kind::Setup, events);
                 }
             }
+            return;
+        }
+        if self.job.as_ref().is_some_and(Running::uploading) {
+            if let Some((cmd, kind)) = self.next_upload_line() {
+                self.send_numbered(&cmd, kind, events);
+                if let (Some(run), Some(p)) = (&self.job, self.status.progress.as_mut()) {
+                    p.done = run.progress.done;
+                }
+            }
+            return;
+        }
+        if let Some(cmd) = self.polls.pop_front() {
+            self.send_numbered(cmd, Kind::Poll, events);
             return;
         }
         let quiet = self.last_rx.elapsed() > QUIET_POLL;
@@ -398,22 +627,21 @@ impl Marlin {
             self.send_numbered("M105", Kind::Poll, events);
             return;
         }
-        if self.status.state() == State::Printing
-            && let Some((cmd, kind)) = self.next_job_line()
-        {
-            self.status.activity = activity(&cmd);
-            self.send_numbered(&cmd, kind, events);
-            if let (Some(run), Some(p)) = (&self.job, self.status.progress.as_mut()) {
-                p.done = run.progress.done;
-                p.layer = run.progress.layer;
-            }
+        let every = if self.job.is_some() || self.status.foreign.is_some() {
+            SD_POLL_BUSY
+        } else {
+            SD_POLL_IDLE
+        };
+        if self.sd_cap != Some(false) && self.last_sd_poll.elapsed() > every {
+            self.last_sd_poll = Instant::now();
+            self.polls.extend(["M27 C", "M27"]);
         }
     }
 
     fn probe(&mut self, events: &mut Vec<Event>) {
         let Handshake::Probing { last, tries } = self.handshake else { return };
         let due = match last {
-            None => self.last_rx.elapsed() > Duration::from_millis(500),
+            None => self.attached_at.elapsed() > Duration::from_millis(500),
             Some(at) => at.elapsed() > PROBE_EVERY,
         };
         if !due {
@@ -432,22 +660,44 @@ impl Marlin {
         }
     }
 
-    fn cancel_with(&mut self, events: &mut Vec<Event>, reason: &str) -> Result<(), String> {
-        if self.job.is_none() {
-            return Err("nothing is printing".into());
-        }
-        self.end_job(Outcome::Cancelled, reason, events);
+    fn stop_upload(&mut self) -> Option<Running> {
+        let run = self.job.take()?;
         self.resend.clear();
         self.resend_from = None;
         self.manual.clear();
+        self.manual.push_back(Queued::Resync);
+        self.manual.push_back(Queued::Plain("M29".into()));
+        self.manual.push_back(Queued::Plain(format!("M30 {}", run.file)));
+        self.status.progress = None;
+        self.status.state = Some(State::Idle);
+        Some(run)
+    }
+
+    fn cancel_with(&mut self, events: &mut Vec<Event>, reason: &str) -> Result<(), String> {
+        match &self.job {
+            None if self.status.foreign.is_some() => {
+                self.manual.push_back(Queued::Plain("M524".into()));
+                return Ok(());
+            }
+            None => return Err("nothing is printing".into()),
+            Some(run) if run.uploading() => {
+                if let Some(run) = self.stop_upload() {
+                    events.push(Event::Interrupted(
+                        run.progress.job,
+                        "cancelled while it was being sent".into(),
+                    ));
+                }
+                return Ok(());
+            }
+            Some(_) => {}
+        }
         if self.write("M108", events) {
             events.push(Event::Console(Dir::Sent, "M108".into()));
         }
-        self.manual.push_back(Queued::Resync);
-        for cmd in ["M104 S0", "M140 S0", "M107"] {
+        for cmd in ["M524", "M104 S0", "M140 S0", "M107"] {
             self.manual.push_back(Queued::Plain(cmd.into()));
         }
-        self.status.state = Some(State::Idle);
+        self.end_job(Outcome::Cancelled, reason, events);
         Ok(())
     }
 }
@@ -471,7 +721,12 @@ impl Printer for Marlin {
         if self.link.is_none() {
             return;
         }
-        if self.in_flight.is_some() && self.last_rx.elapsed() > POKE_AFTER && !self.poked {
+        let uploading = self.job.as_ref().is_some_and(Running::uploading);
+        if self.in_flight.is_some()
+            && self.last_rx.elapsed() > POKE_AFTER
+            && !self.poked
+            && !uploading
+        {
             self.poked = true;
             events.push(Event::Console(Dir::Note, "no answer for 15 s, asking again".into()));
             self.write("M105", events);
@@ -480,11 +735,16 @@ impl Printer for Marlin {
     }
 
     fn start(&mut self, job: Job) -> Result<(), String> {
-        if self.status.state() != State::Idle {
+        if self.status.state() != State::Idle || self.job.is_some() {
             return Err(format!("the printer is {}", self.status.state().label()));
         }
+        if self.sd_cap == Some(false) {
+            return Err("this printer has no SD card to print from".into());
+        }
+        let (layers, total) =
+            gcode::upload_layers(&job.path).map_err(|e| format!("{}: {e}", job.path.display()))?;
         let file = File::open(&job.path).map_err(|e| format!("{}: {e}", job.path.display()))?;
-        let total = file.metadata().map(|m| m.len()).unwrap_or(0);
+        let name = sd_name(job.id);
         let progress = Progress {
             job,
             done: 0,
@@ -493,27 +753,31 @@ impl Printer for Marlin {
             started: SystemTime::now(),
             paused: Duration::ZERO,
             paused_since: None,
+            sending: true,
         };
         self.status.progress = Some(progress.clone());
         self.status.message = None;
+        self.manual.push_back(Queued::Plain("M21".into()));
+        self.manual.push_back(Queued::Kinded(format!("M28 {name}"), Kind::Open));
         self.job = Some(Running {
             progress,
-            reader: BufReader::with_capacity(1 << 16, file),
-            draining: false,
+            file: name,
+            phase: Phase::Opening(BufReader::with_capacity(1 << 16, file)),
+            layers,
+            bytes: total,
         });
         self.status.state = Some(State::Printing);
         Ok(())
     }
 
     fn pause(&mut self) -> Result<(), String> {
-        if self.status.state() != State::Printing {
-            return Err("nothing is printing".into());
+        if self.status.state() != State::Printing
+            || self.job.as_ref().is_none_or(Running::uploading)
+        {
+            return Err("nothing is printing on the printer".into());
         }
-        self.status.state = Some(State::Paused);
-        let now = SystemTime::now();
-        for p in self.job.iter_mut().map(|r| &mut r.progress).chain(self.status.progress.as_mut()) {
-            p.paused_since = Some(now);
-        }
+        self.manual.push_back(Queued::Plain("M25".into()));
+        self.ours(None);
         Ok(())
     }
 
@@ -521,12 +785,9 @@ impl Printer for Marlin {
         if self.status.state() != State::Paused {
             return Err("the printer is not paused".into());
         }
-        self.status.state = Some(State::Printing);
-        let now = SystemTime::now();
-        for p in self.job.iter_mut().map(|r| &mut r.progress).chain(self.status.progress.as_mut()) {
-            if let Some(since) = p.paused_since.take() {
-                p.paused += now.duration_since(since).unwrap_or_default();
-            }
+        self.manual.push_back(Queued::Plain("M24".into()));
+        if self.job.is_some() {
+            self.ours(Some((0, 0)));
         }
         Ok(())
     }
@@ -542,6 +803,9 @@ impl Printer for Marlin {
         if self.link.is_none() {
             return Err("the printer is not connected".into());
         }
+        if self.job.as_ref().is_some_and(Running::uploading) {
+            return Err("the printer is being sent a file; wait for it to finish".into());
+        }
         for cmd in line.lines().filter_map(gcode::command) {
             self.manual.push_back(Queued::Plain(cmd.to_string()));
         }
@@ -555,21 +819,60 @@ impl Printer for Marlin {
 
     fn reconnect(&mut self) {
         let mut events = Vec::new();
-        self.end_job(Outcome::Failed, "reconnected", &mut events);
+        if self.job.as_ref().is_some_and(Running::uploading) {
+            self.interrupt("reconnected while it was being sent", &mut events);
+        }
         self.pending.extend(events);
+        self.away = self.job.is_some();
         self.link = None;
-        self.status = Status::default();
+        let progress = self.status.progress.take();
+        self.status = Status { progress, ..Status::default() };
         self.retry_at = Instant::now();
+    }
+
+    fn adopt(&mut self, job: Job, started: SystemTime, on_printer: bool) {
+        let file = sd_name(job.id);
+        if !on_printer {
+            self.cleanup.push(file);
+            self.pending
+                .push(Event::Interrupted(job, "printfarm closed while it was being sent".into()));
+            return;
+        }
+        let (layers, bytes) = gcode::upload_layers(&job.path).unwrap_or_default();
+        let progress = Progress {
+            job,
+            done: 0,
+            total: 0,
+            layer: 0,
+            started,
+            paused: Duration::ZERO,
+            paused_since: None,
+            sending: false,
+        };
+        self.status.progress = Some(progress.clone());
+        self.job = Some(Running { progress, file, phase: Phase::OnPrinter, layers, bytes });
+        self.away = true;
+    }
+
+    fn leave(&mut self) {
+        if self.job.as_ref().is_some_and(Running::uploading) {
+            self.stop_upload();
+        }
     }
 }
 
 pub fn open(path: &str, baud: u32) -> Result<Box<dyn SerialPort>, String> {
-    serialport::new(path, baud).timeout(READ_TIMEOUT).open().map_err(|e| match e.kind() {
-        serialport::ErrorKind::NoDevice
-        | serialport::ErrorKind::Io(std::io::ErrorKind::NotFound) => {
-            format!("{path} is not there. Plug the printer in and turn it on.")
+    serialport::new(path, baud).timeout(READ_TIMEOUT).open().map_err(|e| {
+        let there = std::path::Path::new(path).exists();
+        match e.kind() {
+            serialport::ErrorKind::NoDevice | serialport::ErrorKind::Io(_) if !there => {
+                format!("{path} is not there. Plug the printer in and turn it on.")
+            }
+            serialport::ErrorKind::NoDevice => {
+                format!("{path} is busy. Another program has the printer open.")
+            }
+            _ => format!("cannot open {path}: {e}"),
         }
-        _ => format!("cannot open {path}: {e}"),
     })
 }
 

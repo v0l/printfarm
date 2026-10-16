@@ -64,6 +64,7 @@ pub struct Progress {
     pub started: SystemTime,
     pub paused: Duration,
     pub paused_since: Option<SystemTime>,
+    pub sending: bool,
 }
 
 impl Progress {
@@ -80,7 +81,8 @@ impl Progress {
         let f = self.fraction() as f64;
         let elapsed = self.elapsed(now).as_secs_f64();
         let by_rate = (f > 0.02).then(|| elapsed / f - elapsed);
-        let by_slicer = self.job.meta.estimate().map(|e| e.as_secs_f64() * (1.0 - f));
+        let by_slicer =
+            self.job.meta.estimate().filter(|_| !self.sending).map(|e| e.as_secs_f64() * (1.0 - f));
         let secs = match (by_slicer, by_rate) {
             (Some(s), Some(r)) => s * (1.0 - f) + r * f,
             (Some(s), None) => s,
@@ -88,6 +90,20 @@ impl Progress {
             (None, None) => return None,
         };
         Some(Duration::from_secs_f64(secs.max(0.0)))
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct Foreign {
+    pub file: String,
+    pub done: u64,
+    pub total: u64,
+    pub printing: bool,
+}
+
+impl Foreign {
+    pub fn fraction(&self) -> f32 {
+        if self.total == 0 { 0.0 } else { (self.done as f64 / self.total as f64) as f32 }
     }
 }
 
@@ -102,6 +118,7 @@ pub struct Status {
     pub message: Option<String>,
     pub activity: Option<&'static str>,
     pub leveling: mesh::Leveling,
+    pub foreign: Option<Foreign>,
 }
 
 impl Status {
@@ -143,6 +160,8 @@ pub enum Dir {
 pub enum Event {
     Console(Dir, String),
     Started(Job),
+    OnPrinter(Job),
+    Interrupted(Job, String),
     Refused(Job, String),
     Finished { job: Job, outcome: Outcome, started: SystemTime, reason: String },
 }
@@ -157,6 +176,8 @@ pub trait Printer: Send {
     fn gcode(&mut self, line: &str) -> Result<(), String>;
     fn settled(&self) -> bool;
     fn reconnect(&mut self);
+    fn adopt(&mut self, job: Job, started: SystemTime, on_printer: bool);
+    fn leave(&mut self);
 }
 
 pub fn open(config: &PrinterConfig) -> Box<dyn Printer> {
@@ -186,6 +207,7 @@ mod tests {
             started: now - Duration::from_secs(elapsed),
             paused: Duration::ZERO,
             paused_since: None,
+            sending: false,
         }
     }
 

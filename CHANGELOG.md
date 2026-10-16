@@ -6,6 +6,16 @@ All notable changes to printfarm are listed here. The format follows
 
 ## [Unreleased]
 
+### Changed
+- A job is copied to the printer's SD card and printed from there, so the printer carries on when
+  printfarm closes. On opening, printfarm asks the printer whether its job is still running,
+  finished while it was away, or whether it is printing something else.
+- Hotend and bed temperatures share one line, and the camera sits beside the card when there is
+  room.
+
+### Added
+- The bed mesh and whether leveling is on are read from the printer.
+
 ## [0.1.0] - 2026-10-16
 
 First release.

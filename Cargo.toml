@@ -31,6 +31,9 @@ serialport = "4.10"
 toml = "0.9"
 ureq = { version = "3.4", default-features = false, features = ["gzip"] }
 
+[target.'cfg(unix)'.dev-dependencies]
+libc = "0.2"
+
 [target.'cfg(windows)'.build-dependencies]
 winresource = "0.1"
 

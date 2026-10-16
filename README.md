@@ -12,13 +12,23 @@ printer is connected.
 
 | backend | how it talks | state |
 |---|---|---|
-| Marlin over USB | G-code streamed over the serial port, with line numbers, checksums and resends | done |
+| Marlin over USB | the job is copied to the printer's SD card over the serial port, with line numbers, checksums and resends, then printed from the card | done |
 | Moonraker, OctoPrint, PrusaLink, Bambu LAN | the printer's own host on the network | planned |
 
-A Marlin printer on USB is printed from this computer, so closing printfarm
-stops the print. printfarm asks first, and if you go ahead it cancels the print
-and turns the heaters off before it exits. A print it lost track of because it
-was killed is logged as failed the next time it starts.
+A printer runs its own job. Starting a job copies it to the printer's SD card
+as `PF<job>.GCO` and starts it there, so closing printfarm, a crash or a
+pulled USB cable does not stop the print. The only thing printfarm asks before
+closing about is a copy that is still going; that job goes back to the top of
+the queue.
+
+When printfarm opens, or the printer comes back, it asks the printer what it
+is doing (`M27 C`, `M27`) and reports one of three things: the job it sent is
+still printing (or paused), that job finished while printfarm was away, or the
+printer is printing something printfarm did not send. The file is deleted from
+the card once its print ends.
+
+The copy runs at the speed the printer acknowledges lines, so a long print
+takes a while to send before it starts.
 
 Add a printer with "add printer". On Linux the port list offers the
 `/dev/serial/by-path` name, which stays the same across replugs as long as the
@@ -80,10 +90,12 @@ cargo run --example sim /tmp/printfarm-sim   # a simulated Marlin printer on a p
 ```
 
 Point a printer at `/tmp/printfarm-sim` to try the panel without hardware. The
-simulator heats up slowly, answers temperature reports and checks every line
-number and checksum it is sent. The tests in `tests/marlin.rs` run the Marlin
-backend against it, including a forced resend, a halted printer, a lost link
-and a cancel during a heating wait.
+simulator heats up slowly, checks every line number and checksum it is sent,
+and has an SD card that keeps its files and its print while printfarm is
+closed. The tests in `tests/marlin.rs` run the Marlin backend against it: a
+forced resend during a copy, a print picked up again after printfarm was
+closed, one that finished while it was away, one printfarm did not start, a
+missing card, a lost link and a halted printer.
 
 ## Release
 

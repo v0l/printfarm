@@ -115,6 +115,28 @@ pub fn scan(path: &Path) -> std::io::Result<Meta> {
     Ok(meta)
 }
 
+pub fn upload_layers(path: &Path) -> std::io::Result<(Vec<u64>, u64)> {
+    let mut reader = BufReader::with_capacity(1 << 16, std::fs::File::open(path)?);
+    let mut layers = Vec::new();
+    let mut total = 0u64;
+    let mut line = String::new();
+    loop {
+        line.clear();
+        if reader.read_line(&mut line)? == 0 {
+            return Ok((layers, total));
+        }
+        if is_layer_change(&line) {
+            layers.push(total);
+        } else if let Some(cmd) = command(&line) {
+            total += cmd.len() as u64 + 1;
+        }
+    }
+}
+
+pub fn layer_at(layers: &[u64], pos: u64) -> usize {
+    layers.partition_point(|&start| start <= pos)
+}
+
 pub fn thumbnail(path: &Path) -> Option<Thumbnail> {
     let file = std::fs::File::open(path).ok()?;
     let mut best: Option<(usize, Vec<u8>)> = None;

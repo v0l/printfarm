@@ -27,6 +27,8 @@ pub fn history_path() -> PathBuf {
 pub struct Running {
     pub job: Job,
     pub started: u64,
+    #[serde(default)]
+    pub on_printer: bool,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -94,10 +96,6 @@ impl Queue {
 
     pub fn next_for(&self, printer: &str) -> Option<&Job> {
         self.jobs.iter().find(|j| j.printer.as_deref().is_none_or(|p| p == printer))
-    }
-
-    pub fn orphans(&mut self) -> Vec<(String, Running)> {
-        std::mem::take(&mut self.running).into_iter().collect()
     }
 }
 

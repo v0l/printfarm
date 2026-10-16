@@ -44,8 +44,16 @@ pub struct Station {
 }
 
 impl Station {
-    pub fn spawn(config: PrinterConfig, events: Sender<(String, Event)>, wake: Wake) -> Station {
-        let backend = printer::open(&config);
+    pub fn spawn(
+        config: PrinterConfig,
+        watch: Option<(Job, SystemTime, bool)>,
+        events: Sender<(String, Event)>,
+        wake: Wake,
+    ) -> Station {
+        let mut backend = printer::open(&config);
+        if let Some((job, started, on_printer)) = watch {
+            backend.adopt(job, started, on_printer);
+        }
         Station::with(config, backend, events, wake)
     }
 
@@ -115,6 +123,7 @@ fn run(
             };
             let r = match c {
                 Control::Quit => {
+                    backend.leave();
                     settle(backend.as_mut(), &mut out);
                     return;
                 }

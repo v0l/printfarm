@@ -11,7 +11,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::mpsc::{Receiver, Sender, channel};
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 const CARD_W: f32 = 380.0;
 const PRESETS: [(&str, u32, u32); 3] = [("PLA", 210, 60), ("PETG", 240, 80), ("ABS", 250, 100)];
@@ -99,7 +99,6 @@ pub struct App {
     removing: Option<usize>,
     cancelling: Option<usize>,
     closing: bool,
-    quitting: bool,
     big_camera: Option<String>,
     notice: Option<(bool, String)>,
 }
@@ -144,24 +143,9 @@ impl App {
             removing: None,
             cancelling: None,
             closing: false,
-            quitting: false,
             big_camera: None,
             notice,
         };
-        for (printer, run) in app.queue.orphans() {
-            let name = app.printer_name(&printer);
-            let mut record = Record::new(
-                &run.job,
-                &name,
-                run.started,
-                Outcome::Failed,
-                "printfarm closed during the print",
-            );
-            record.ended = run.started;
-            app.log(record);
-            app.queue.unclear.insert(printer);
-        }
-        app.save_queue();
         app.restart_stations();
         for path in open {
             app.enqueue(&path, None);
@@ -180,14 +164,19 @@ impl App {
 
     fn restart_stations(&mut self) {
         self.stations.clear();
-        for p in &self.config.printers {
-            self.stations.push(Station::spawn(
-                p.clone(),
-                self.events_tx.clone(),
-                self.wake.clone(),
-            ));
+        for i in 0..self.config.printers.len() {
+            let station = self.station(self.config.printers[i].clone());
+            self.stations.push(station);
         }
         self.sync_cameras();
+    }
+
+    fn station(&self, p: PrinterConfig) -> Station {
+        let watch =
+            self.queue.running.get(&p.id).map(|r| {
+                (r.job.clone(), UNIX_EPOCH + Duration::from_secs(r.started), r.on_printer)
+            });
+        Station::spawn(p, watch, self.events_tx.clone(), self.wake.clone())
     }
 
     fn sync_cameras(&mut self) {
@@ -243,7 +232,22 @@ impl App {
             let name = self.printer_name(&printer);
             match e {
                 Event::Started(job) => {
-                    self.queue.running.insert(printer, farm::Running { job, started: farm::now() });
+                    let run = farm::Running { job, started: farm::now(), on_printer: false };
+                    self.queue.running.insert(printer, run);
+                    self.save_queue();
+                }
+                Event::OnPrinter(job) => {
+                    let run = farm::Running { job, started: farm::now(), on_printer: true };
+                    self.queue.running.insert(printer, run);
+                    self.save_queue();
+                }
+                Event::Interrupted(job, why) => {
+                    self.notice = Some((
+                        false,
+                        format!("{} is back at the top of the queue: {why}", job.name),
+                    ));
+                    self.queue.running.remove(&printer);
+                    self.queue.jobs.insert(0, job);
                     self.save_queue();
                 }
                 Event::Refused(job, why) => {
@@ -332,12 +336,15 @@ impl App {
         }
     }
 
-    fn busy(&self) -> Vec<String> {
+    fn sending(&self) -> Vec<String> {
         self.stations
             .iter()
-            .filter(|s| s.status().state().busy())
-            .map(|s| s.config.name.clone())
+            .filter_map(|s| s.status().progress.filter(|p| p.sending).map(|p| p.job.name))
             .collect()
+    }
+
+    fn busy(&self) -> bool {
+        self.stations.iter().any(|s| s.status().state().busy())
     }
 
     fn header(&mut self, ui: &mut Ui, acts: &mut Vec<Act>) {
@@ -785,16 +792,13 @@ impl App {
                     p.link = link;
                     p.camera = camera;
                     let p = p.clone();
-                    self.stations[i] = Station::spawn(p, self.events_tx.clone(), self.wake.clone());
+                    self.stations[i] = self.station(p);
                 }
                 None => {
                     let id = self.config.fresh_id(&name);
                     let p = PrinterConfig { id, name, link, camera };
-                    self.stations.push(Station::spawn(
-                        p.clone(),
-                        self.events_tx.clone(),
-                        self.wake.clone(),
-                    ));
+                    let station = self.station(p.clone());
+                    self.stations.push(station);
                     self.config.printers.push(p);
                 }
             }
@@ -841,11 +845,20 @@ impl App {
         }
         if let Some(i) = self.cancelling {
             let name = self.config.printers[i].name.clone();
-            let job = self.stations[i].status().progress.map(|p| p.job.name).unwrap_or_default();
+            let progress = self.stations[i].status().progress;
+            let sending = progress.as_ref().is_some_and(|p| p.sending);
+            let job = progress.map(|p| p.job.name).unwrap_or_default();
             let m = egui::Modal::new(Id::new("cancel")).show(ctx, |ui| {
                 ui.set_width(380.0);
                 modal_title(ui, &format!("Cancel {job}?"));
-                note(ui, format!("{name} stops, and its heaters and fan are turned off."), LEGEND);
+                let said = if sending {
+                    format!(
+                        "{name} stops receiving it and the job goes back to the top of the queue."
+                    )
+                } else {
+                    format!("{name} stops, and its heaters and fan are turned off.")
+                };
+                note(ui, said, LEGEND);
                 footer(ui, |ui| {
                     if ui.add(Key::new("cancel print").solid(FAULT).min_width(120.0)).clicked() {
                         self.stations[i].send(Control::Cancel);
@@ -861,29 +874,25 @@ impl App {
             }
         }
         if self.closing {
-            let busy = self.busy();
+            let sending = self.sending();
             let m = egui::Modal::new(Id::new("closing")).show(ctx, |ui| {
                 ui.set_width(400.0);
-                modal_title(ui, "A print is running");
+                modal_title(ui, "Still sending to a printer");
                 note(
                     ui,
                     format!(
-                        "{} is printing from this computer over USB. Closing printfarm cancels the print and turns the heaters off.",
-                        busy.join(", ")
+                        "{} is still being copied to the printer. Closing printfarm stops the copy and puts it back at the top of the queue. Prints already on a printer carry on.",
+                        sending.join(", ")
                     ),
                     WARN,
                 );
                 footer(ui, |ui| {
-                    if ui.add(Key::new("cancel and close").solid(FAULT).min_width(140.0)).clicked() {
+                    if ui.add(Key::new("close anyway").solid(FAULT).min_width(140.0)).clicked() {
                         self.closing = false;
-                        self.quitting = true;
-                        for s in &self.stations {
-                            if s.status().state().busy() {
-                                s.send(Control::Cancel);
-                            }
-                        }
+                        self.stations.clear();
+                        ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
                     }
-                    if ui.add(Key::new("keep printing").outline(VALUE).min_width(120.0)).clicked() {
+                    if ui.add(Key::new("keep sending").outline(VALUE).min_width(120.0)).clicked() {
                         self.closing = false;
                     }
                 });
@@ -1019,16 +1028,9 @@ impl eframe::App for App {
     fn ui(&mut self, ui: &mut Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
         self.events();
-        if self.quitting && self.busy().is_empty() {
-            self.events();
-            self.stations.clear();
-            self.events();
-            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
-        }
         if ctx.input(|i| i.viewport().close_requested())
-            && !self.busy().is_empty()
+            && !self.sending().is_empty()
             && !self.closing
-            && !self.quitting
         {
             self.closing = true;
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
@@ -1076,7 +1078,7 @@ impl eframe::App for App {
         self.editor(&ctx);
         self.confirmations(&ctx);
         self.files(&ctx);
-        if !self.busy().is_empty() {
+        if self.busy() {
             ctx.request_repaint_after(Duration::from_secs(1));
         }
     }
@@ -1149,6 +1151,17 @@ fn heater_line(ui: &mut Ui, status: &crate::printer::Status, samples: &HashMap<S
     });
 }
 
+fn progress_hero(ui: &mut Ui, label: &str, fraction: f32, tint: Color32) {
+    hero(ui, label, &format!("{:.1}", fraction * 100.0), "%", tint);
+    let r = ui.allocate_exact_size(Vec2::new(ui.available_width(), 8.0), Sense::hover()).0;
+    bar(ui.painter(), r, fraction, tint);
+    ui.add_space(4.0);
+}
+
+fn megabytes(bytes: u64) -> String {
+    format!("{:.1} MB", bytes as f64 / 1e6)
+}
+
 fn printer_info(ui: &mut Ui, d: &CardData, acts: &mut Vec<Act>) {
     let (i, config, status, now) = (d.i, &d.config, &d.status, d.now);
     let (unclear, next) = (d.unclear, &d.next);
@@ -1166,6 +1179,13 @@ fn printer_info(ui: &mut Ui, d: &CardData, acts: &mut Vec<Act>) {
     match state {
         State::Offline | State::Connecting => {
             note(ui, &status.detail, if state == State::Offline { WARN } else { LEGEND });
+            if let Some(p) = &status.progress {
+                Line::new().legend("on the printer").value(&p.job.name).elided(ui);
+                Line::new()
+                    .note("printfarm checks on it when the printer answers")
+                    .size(10.5)
+                    .elided(ui);
+            }
         }
         State::Fault => {
             note(ui, &status.detail, FAULT);
@@ -1175,18 +1195,27 @@ fn printer_info(ui: &mut Ui, d: &CardData, acts: &mut Vec<Act>) {
             }
         }
         State::Printing | State::Paused => {
-            if let Some(p) = &status.progress {
-                let pct = format!("{:.1}", p.fraction() * 100.0);
-                hero(ui, &p.job.name, &pct, "%", if state == State::Paused { WARN } else { TRACE });
-                let r =
-                    ui.allocate_exact_size(Vec2::new(ui.available_width(), 8.0), Sense::hover()).0;
-                bar(
-                    ui.painter(),
-                    r,
-                    p.fraction(),
-                    if state == State::Paused { WARN } else { TRACE },
+            let tint = if state == State::Paused { WARN } else { TRACE };
+            if let Some(p) = status.progress.as_ref().filter(|p| p.sending) {
+                progress_hero(ui, &format!("sending {}", p.job.name), p.fraction(), TRACE);
+                readouts(
+                    ui,
+                    &[
+                        ("sent", format!("{} / {}", megabytes(p.done), megabytes(p.total)), VALUE),
+                        ("left", p.remaining(now).map(hms).unwrap_or("-".into()), VALUE),
+                    ],
+                );
+                note(
+                    ui,
+                    "Copying it to the printer's SD card. The printer starts it once the copy is done.",
+                    LEGEND,
                 );
                 ui.add_space(4.0);
+                if ui.add(Key::new("cancel").outline(FAULT).min_width(100.0)).clicked() {
+                    acts.push(Act::Cancel(i));
+                }
+            } else if let Some(p) = &status.progress {
+                progress_hero(ui, &p.job.name, p.fraction(), tint);
                 let layers = if p.job.meta.layers > 0 {
                     format!("{} / {}", p.layer, p.job.meta.layers)
                 } else {
@@ -1206,20 +1235,36 @@ fn printer_info(ui: &mut Ui, d: &CardData, acts: &mut Vec<Act>) {
                 if let Some(m) = &status.message {
                     Line::new().legend("says").value(m).elided(ui);
                 }
+                Line::new()
+                    .note("printing from its SD card, it carries on if printfarm closes")
+                    .size(10.5)
+                    .elided(ui);
+                ui.add_space(2.0);
+                ui.horizontal(|ui| {
+                    let (label, act) = if state == State::Paused {
+                        ("resume", Act::Resume(i))
+                    } else {
+                        ("pause", Act::Pause(i))
+                    };
+                    if ui.add(Key::new(label).solid(READOUT).min_width(100.0)).clicked() {
+                        acts.push(act);
+                    }
+                    if ui.add(Key::new("cancel").outline(FAULT).min_width(100.0)).clicked() {
+                        acts.push(Act::Cancel(i));
+                    }
+                });
+            } else if let Some(f) = &status.foreign {
+                progress_hero(ui, &f.file, f.fraction(), tint);
+                note(
+                    ui,
+                    if f.printing {
+                        "Printing a file printfarm did not send. Use the printer's own screen to control it."
+                    } else {
+                        "Paused on a file printfarm did not send. Use the printer's own screen to control it."
+                    },
+                    LEGEND,
+                );
             }
-            ui.horizontal(|ui| {
-                let (label, act) = if state == State::Paused {
-                    ("resume", Act::Resume(i))
-                } else {
-                    ("pause", Act::Pause(i))
-                };
-                if ui.add(Key::new(label).solid(READOUT).min_width(100.0)).clicked() {
-                    acts.push(act);
-                }
-                if ui.add(Key::new("cancel").outline(FAULT).min_width(100.0)).clicked() {
-                    acts.push(Act::Cancel(i));
-                }
-            });
         }
         State::Idle => {
             if unclear {
