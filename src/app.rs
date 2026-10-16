@@ -1088,7 +1088,7 @@ impl App {
                     Some(m) => {
                         mesh_map(ui, m);
                         let when = when(farm::unix(m.read));
-                        let what = if m.probed { "probed" } else { "stored on the printer, read" };
+                        let what = if m.probed { "probed" } else { "read from the printer" };
                         Line::new()
                             .note(format!("{what} {when}. Positive is where the bed is high."))
                             .size(10.5)
