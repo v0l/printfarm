@@ -29,6 +29,8 @@ pub struct PrinterConfig {
     pub link: Link,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub camera: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub filament: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -110,6 +112,7 @@ mod tests {
                 name: "Ender-3 Pro".into(),
                 link: Link::MarlinUsb { port: "/dev/ttyUSB0".into(), baud: 1_000_000 },
                 camera: Some("http://cam/snapshot.jpg".into()),
+                filament: Some("PLA".into()),
             }],
         };
         let text = toml::to_string_pretty(&c).unwrap();
@@ -126,6 +129,7 @@ mod tests {
             name: String::new(),
             link: Link::MarlinUsb { port: String::new(), baud: 0 },
             camera: None,
+            filament: None,
         });
         assert_eq!(c.fresh_id("Ender 3 Pro"), "ender-3-pro-2");
         assert_eq!(c.fresh_id("!!"), "printer");

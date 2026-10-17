@@ -4,16 +4,18 @@ use crate::farm::{self, Queue, Record};
 use crate::gcode;
 use crate::printer::marlin::{self, BAUDS, Detected, PortInfo};
 use crate::printer::{Dir, Event, Outcome, State};
+use crate::removable::{self, Transfer, Volume};
 use crate::station::{Control, Station, Wake};
 use egui::{Color32, FontId, Id, Rect, Sense, Stroke, TextureHandle, TextureOptions, Ui, Vec2};
 use egui_bench::prelude::*;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::sync::mpsc::{Receiver, Sender, channel};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 const CARD_W: f32 = 380.0;
+const FILAMENTS: [&str; 8] = ["PLA", "PETG", "ABS", "ASA", "TPU", "PA", "PC", "PVA"];
 const PRESETS: [(&str, u32, u32); 3] = [("PLA", 210, 60), ("PETG", 240, 80), ("ABS", 250, 100)];
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -41,8 +43,10 @@ enum Act {
     Assign(u64, Option<String>),
     Again(usize),
     Mesh(usize),
+    Files(usize),
     Probe(usize),
     SaveMesh(usize),
+    Filament(usize, Option<String>),
 }
 
 struct Editor {
@@ -80,6 +84,52 @@ struct Thumb {
     texture: Option<TextureHandle>,
 }
 
+struct CopyDialog {
+    volume: Volume,
+    picked: HashSet<u64>,
+}
+
+struct Copying {
+    volume: Volume,
+    transfer: Arc<Transfer>,
+}
+
+enum Delete {
+    Card(String),
+    Stick(PathBuf, String),
+}
+
+struct Files {
+    printer: Option<String>,
+    volume: Option<String>,
+    dir: Vec<String>,
+    listing: Option<(std::time::Instant, PathBuf, Vec<removable::Entry>)>,
+    confirm: Option<Delete>,
+}
+
+struct Ejecting {
+    result: Receiver<Result<String, String>>,
+}
+
+fn watch_volumes(wake: Wake) -> Arc<Mutex<Option<Vec<Volume>>>> {
+    let shared = Arc::new(Mutex::new(None));
+    let out = shared.clone();
+    std::thread::spawn(move || {
+        loop {
+            let now = removable::list();
+            {
+                let mut held = out.lock().unwrap();
+                if held.as_ref() != Some(&now) {
+                    *held = Some(now);
+                    wake();
+                }
+            }
+            std::thread::sleep(Duration::from_secs(2));
+        }
+    });
+    shared
+}
+
 pub struct App {
     config: Config,
     config_path: PathBuf,
@@ -107,6 +157,13 @@ pub struct App {
     probing: Option<(usize, u32)>,
     saving_mesh: Option<usize>,
     notice: Option<(bool, String)>,
+    media: Arc<Mutex<Option<Vec<Volume>>>>,
+    volumes: Vec<Volume>,
+    seen: Option<HashSet<String>>,
+    copy_dialog: Option<CopyDialog>,
+    copying: Option<Copying>,
+    ejecting: Option<Ejecting>,
+    files: Option<Files>,
 }
 
 impl App {
@@ -154,7 +211,18 @@ impl App {
             probing: None,
             saving_mesh: None,
             notice,
+            media: Arc::new(Mutex::new(None)),
+            volumes: Vec::new(),
+            seen: None,
+            copy_dialog: None,
+            copying: None,
+            ejecting: None,
+            files: None,
         };
+        app.media = watch_volumes(app.wake.clone());
+        if app.queue.fill_in() {
+            app.save_queue();
+        }
         app.restart_stations();
         for path in open {
             app.enqueue(&path, None);
@@ -282,11 +350,210 @@ impl App {
         }
     }
 
+    fn media_events(&mut self) {
+        if let Some(now) = self.media.lock().unwrap().clone() {
+            let devices: HashSet<String> = now.iter().map(|v| v.device.clone()).collect();
+            if let Some(seen) = &self.seen
+                && let Some(v) = now.iter().find(|v| !seen.contains(&v.device))
+            {
+                self.notice = Some((true, format!("{} is mounted", v.label)));
+            }
+            self.seen = Some(devices.clone());
+            self.volumes = now;
+            if let Some(d) = &self.copy_dialog
+                && !devices.contains(&d.volume.device)
+            {
+                self.copy_dialog = None;
+            }
+        }
+        if let Some(e) = &self.ejecting
+            && let Ok(result) = e.result.try_recv()
+        {
+            self.ejecting = None;
+            self.notice = Some(match result {
+                Ok(said) => (true, said),
+                Err(said) => (false, said),
+            });
+        }
+        let finished = self.copying.as_ref().and_then(|c| c.transfer.report().map(|r| (c, r)));
+        if let Some((c, report)) = finished {
+            let label = c.volume.label.clone();
+            let ids: Vec<u64> = report.copied.iter().map(|c| c.id).collect();
+            let fresh = report.copied.iter().filter(|c| c.fresh).count();
+            let said = match (&report.failed, report.stopped) {
+                (Some(e), _) => {
+                    (false, format!("Copy to {label} failed after {} files: {e}", ids.len()))
+                }
+                (None, true) => {
+                    (false, format!("Copy to {label} stopped after {} files", ids.len()))
+                }
+                (None, false) => (
+                    true,
+                    format!(
+                        "{} files are on {label} ({fresh} copied), eject it before pulling it out",
+                        ids.len()
+                    ),
+                ),
+            };
+            for copied in &report.copied {
+                if let Some(job) = self.queue.jobs.iter_mut().find(|j| j.id == copied.id) {
+                    job.card = Some(copied.file.clone());
+                }
+            }
+            self.save_queue();
+            self.copying = None;
+            self.notice = Some(said);
+        }
+    }
+
+    fn media_bar(&mut self, ui: &mut Ui) {
+        let volumes = self.volumes.clone();
+        for v in volumes {
+            ui.horizontal(|ui| {
+                chip(ui, "removable", READOUT, true);
+                Line::new().value(&v.label).size(13.0).show(ui);
+                let free = v.free.map(|f| format!(", {} free", megabytes(f))).unwrap_or_default();
+                Line::new()
+                    .note(format!("{} {}{free}, {}", v.fs, megabytes(v.size), v.mount.display()))
+                    .size(10.5)
+                    .show(ui);
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    let copying = self.copying.is_some();
+                    let ejecting = self.ejecting.is_some();
+                    let label = if ejecting { "ejecting" } else { "eject" };
+                    if ui
+                        .add(Key::new(label).outline(WARN).enabled(!copying && !ejecting))
+                        .clicked()
+                    {
+                        let (tx, result) = channel();
+                        let wake = self.wake.clone();
+                        let volume = v.clone();
+                        std::thread::spawn(move || {
+                            let _ = tx.send(removable::eject(&volume));
+                            wake();
+                        });
+                        self.ejecting = Some(Ejecting { result });
+                    }
+                    if ui.add(Key::new("browse").outline(VALUE)).clicked() {
+                        self.files = Some(Files {
+                            printer: self.config.printers.first().map(|p| p.id.clone()),
+                            volume: Some(v.device.clone()),
+                            dir: Vec::new(),
+                            listing: None,
+                            confirm: None,
+                        });
+                    }
+                    let can = !copying && !ejecting && !self.queue.jobs.is_empty();
+                    if ui.add(Key::new("copy queue").solid(READOUT).enabled(can)).clicked() {
+                        let picked = self
+                            .queue
+                            .jobs
+                            .iter()
+                            .filter(|j| j.path.exists())
+                            .map(|j| j.id)
+                            .collect();
+                        self.copy_dialog = Some(CopyDialog { volume: v.clone(), picked });
+                    }
+                    if self.queue.jobs.is_empty() {
+                        Line::new().note("nothing queued").size(10.5).show(ui);
+                    }
+                });
+            });
+        }
+    }
+
+    fn media_windows(&mut self, ctx: &egui::Context) {
+        if let Some(mut d) = self.copy_dialog.take() {
+            let jobs = self.queue.jobs.clone();
+            let size = |id: u64| {
+                jobs.iter()
+                    .find(|j| j.id == id)
+                    .and_then(|j| std::fs::metadata(&j.path).ok())
+                    .map_or(0, |m| m.len())
+            };
+            let need: u64 = d.picked.iter().map(|id| size(*id)).sum();
+            let free = removable::free_space(&d.volume.mount).or(d.volume.free);
+            let fits = free.is_none_or(|f| f >= need);
+            let (mut go, mut cancel) = (false, false);
+            let m = egui::Modal::new(Id::new("copy queue")).show(ctx, |ui| {
+                ui.set_width(460.0);
+                modal_title(ui, &format!("Copy the queue to {}", d.volume.label));
+                egui::ScrollArea::vertical().max_height(260.0).show(ui, |ui| {
+                    for job in &jobs {
+                        let missing = !job.path.exists();
+                        let mut on = d.picked.contains(&job.id);
+                        let text = format!("{}  {}", job.name, megabytes(size(job.id)));
+                        if ui.add_enabled(!missing, egui::Checkbox::new(&mut on, text)).changed() {
+                            if on {
+                                d.picked.insert(job.id);
+                            } else {
+                                d.picked.remove(&job.id);
+                            }
+                        }
+                    }
+                });
+                ui.add_space(6.0);
+                let space = match free {
+                    Some(f) => format!("{} to copy, {} free on the card", megabytes(need), megabytes(f)),
+                    None => format!("{} to copy", megabytes(need)),
+                };
+                note(ui, space, if fits { LEGEND } else { FAULT });
+                note(
+                    ui,
+                    "Files go in the top folder of the card with names of up to eight letters, which is what the printer needs to open them. The jobs stay in the queue, marked as on the card, and the printer starts them from the card over serial. A different file with the same name gets ~2 in its name.",
+                    LEGEND,
+                );
+                footer(ui, |ui| {
+                    let ready = !d.picked.is_empty() && fits;
+                    if ui.add(Key::new("copy").solid(READOUT).min_width(100.0).enabled(ready)).clicked() {
+                        go = true;
+                    }
+                    if ui.add(Key::new("cancel").outline(VALUE).min_width(100.0)).clicked() {
+                        cancel = true;
+                    }
+                });
+            });
+            if go {
+                let list: Vec<(u64, PathBuf)> = jobs
+                    .iter()
+                    .filter(|j| d.picked.contains(&j.id))
+                    .map(|j| (j.id, j.path.clone()))
+                    .collect();
+                let transfer = Transfer::spawn(list, d.volume.mount.clone(), self.wake.clone());
+                self.copying = Some(Copying { volume: d.volume, transfer });
+            } else if !cancel && !m.should_close() {
+                self.copy_dialog = Some(d);
+            }
+        }
+        if let Some(c) = &self.copying {
+            let (done, total, file) = c.transfer.progress();
+            let label = c.volume.label.clone();
+            let mut stop = false;
+            egui::Modal::new(Id::new("copying")).show(ctx, |ui| {
+                ui.set_width(420.0);
+                modal_title(ui, &format!("Copying to {label}"));
+                progress(ui, "file", done as f32, Some(total as f32), &file);
+                note(ui, format!("{} of {}", megabytes(done), megabytes(total)), LEGEND);
+                footer(ui, |ui| {
+                    if ui.add(Key::new("stop").outline(FAULT).min_width(100.0)).clicked() {
+                        stop = true;
+                    }
+                });
+            });
+            if stop {
+                c.transfer.stop();
+            }
+        }
+    }
+
     fn apply(&mut self, acts: Vec<Act>) {
         for act in acts {
             match act {
                 Act::Start(i, id) => {
-                    if let Some(job) = self.queue.take(id) {
+                    if let Some(mut job) = self.queue.take(id) {
+                        if let Some(files) = self.stations[i].status().card {
+                            job.card = removable::on_card(&job.path, &files);
+                        }
                         self.stations[i].send(Control::Start(job));
                         self.save_queue();
                     }
@@ -305,9 +572,24 @@ impl App {
                 }
                 Act::Remove(i) => self.removing = Some(i),
                 Act::Console(i) => self.console = Some(self.config.printers[i].id.clone()),
+                Act::Files(i) => {
+                    self.files = Some(Files {
+                        printer: Some(self.config.printers[i].id.clone()),
+                        volume: None,
+                        dir: Vec::new(),
+                        listing: None,
+                        confirm: None,
+                    });
+                    self.list_card(i);
+                }
                 Act::Mesh(i) => self.mesh = Some(self.config.printers[i].id.clone()),
                 Act::Probe(i) => self.probing = Some((i, 0)),
                 Act::SaveMesh(i) => self.saving_mesh = Some(i),
+                Act::Filament(i, f) => {
+                    self.config.printers[i].filament = f.clone();
+                    self.stations[i].config.filament = f;
+                    self.save_config();
+                }
                 Act::Camera(i) => self.big_camera = Some(self.config.printers[i].id.clone()),
                 Act::Pick(printer) => {
                     let dir = self
@@ -446,17 +728,26 @@ impl App {
         }
         let state = status.state();
         let tint = state_tint(state);
+        let next =
+            self.queue.next_for(&config.id, config.filament.as_deref()).cloned().map(|mut job| {
+                if let Some(files) = &status.card {
+                    job.card = removable::on_card(&job.path, files);
+                }
+                job
+            });
         let card_data = CardData {
             i,
             config: config.clone(),
             status,
             samples,
             unclear: self.queue.unclear.contains(&config.id),
-            next: self.queue.next_for(&config.id).cloned(),
+            next,
+            waiting: self.queue.waiting_for_filament(&config.id, config.filament.as_deref()),
             now,
         };
         let (frame, cam_error) = self.camera_texture(ui.ctx(), &config.id);
         let has_camera = config.camera.is_some();
+        let filament_pick = std::cell::Cell::new(None::<Option<String>>);
         card(
             ui,
             Some(tint),
@@ -464,6 +755,20 @@ impl App {
                 Line::new().legend(&config.name).show(ui);
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     chip(ui, state.label(), tint, state != State::Offline);
+                    let loaded = config.filament.clone().unwrap_or_else(|| "any filament".into());
+                    let r = chip(ui, &loaded, READOUT, config.filament.is_some())
+                        .interact(Sense::click())
+                        .on_hover_text("the filament loaded, click to change");
+                    egui::Popup::menu(&r).width(160.0).show(|ui| {
+                        for f in FILAMENTS {
+                            if ui.button(action(f)).clicked() {
+                                filament_pick.set(Some(Some(f.to_string())));
+                            }
+                        }
+                        if ui.button(action("Any filament")).clicked() {
+                            filament_pick.set(Some(None));
+                        }
+                    });
                 });
             },
             |ui| {
@@ -498,6 +803,9 @@ impl App {
                 }
             },
         );
+        if let Some(f) = filament_pick.take() {
+            acts.push(Act::Filament(i, f));
+        }
     }
 
     fn thumb(&mut self, ctx: &egui::Context, path: &Path) -> Option<egui::TextureId> {
@@ -594,6 +902,22 @@ impl App {
                                 acts.push(Act::Assign(job.id, pick));
                             }
                         });
+                        if let Some(file) = &job.card {
+                            chip(ui, "on card", OK, true)
+                                .on_hover_text(format!("{file} is on the printer's card"));
+                        }
+                        let held = job
+                            .printer
+                            .as_deref()
+                            .and_then(|id| self.config.printers.iter().find(|p| p.id == id));
+                        if let Some(p) = held.filter(|p| !farm::fits(job, p.filament.as_deref())) {
+                            chip(ui, "wrong filament", WARN, true).on_hover_text(format!(
+                                "{} has {} loaded, this job is {}",
+                                p.name,
+                                p.filament.as_deref().unwrap_or("-"),
+                                job.meta.filament.as_deref().unwrap_or("-"),
+                            ));
+                        }
                     });
                 });
             }
@@ -808,7 +1132,7 @@ impl App {
                 }
                 None => {
                     let id = self.config.fresh_id(&name);
-                    let p = PrinterConfig { id, name, link, camera };
+                    let p = PrinterConfig { id, name, link, camera, filament: None };
                     let station = self.station(p.clone());
                     self.stations.push(station);
                     self.config.printers.push(p);
@@ -1040,6 +1364,331 @@ impl App {
         }
     }
 
+    fn list_card(&mut self, i: usize) {
+        let idle = self.stations[i].status().state() == State::Idle;
+        let cmd = if idle { "M21\nM20" } else { "M20" };
+        self.stations[i].send(Control::Gcode(cmd.into()));
+    }
+
+    fn files_window(&mut self, ctx: &egui::Context, acts: &mut Vec<Act>) {
+        let Some(mut files) = self.files.take() else { return };
+        let printer = files
+            .printer
+            .as_ref()
+            .and_then(|id| self.config.printers.iter().position(|p| &p.id == id));
+        if files.printer.is_some() && printer.is_none() {
+            return;
+        }
+        let volume = self
+            .volumes
+            .iter()
+            .find(|v| files.volume.as_ref().is_none_or(|d| &v.device == d))
+            .cloned();
+        if let Some(v) = &volume {
+            files.volume = Some(v.device.clone());
+        } else if files.volume.is_some() {
+            files.volume = None;
+            files.dir.clear();
+            files.listing = None;
+        }
+        let here = volume.as_ref().map(|v| {
+            let mut p = v.mount.clone();
+            p.extend(&files.dir);
+            p
+        });
+        let stale = match (&files.listing, &here) {
+            (Some((at, dir, _)), Some(h)) => dir != h || at.elapsed() > Duration::from_secs(2),
+            (None, Some(_)) => true,
+            _ => false,
+        };
+        if stale && let Some(h) = &here {
+            let list = removable::read_dir(h).unwrap_or_default();
+            files.listing = Some((std::time::Instant::now(), h.clone(), list));
+        }
+        let status = printer.map(|i| self.stations[i].status());
+        let busy = status.as_ref().is_some_and(|s| s.state().busy());
+        let unclear =
+            printer.is_some_and(|i| self.queue.unclear.contains(&self.config.printers[i].id));
+        let idle = status.as_ref().is_some_and(|s| s.state() == State::Idle) && !unclear;
+        let jobs = self.queue.jobs.clone();
+        let title = match printer {
+            Some(i) => format!("{} files", self.config.printers[i].name),
+            None => "files".to_string(),
+        };
+        let mut open = true;
+        let mut delete = None;
+        let mut queue_path: Option<PathBuf> = None;
+        let mut go_in: Option<String> = None;
+        let mut go_up = false;
+        let mut refresh = false;
+        let mut print: Option<String> = None;
+        egui::Window::new(title)
+            .id(Id::new("files window"))
+            .open(&mut open)
+            .default_size([860.0, 480.0])
+            .show(ctx, |ui| {
+                ui.columns(2, |cols| {
+                    let ui = &mut cols[0];
+                    ui.set_max_width(ui.available_width() - 24.0);
+                    ui.horizontal(|ui| {
+                        Line::new().legend("printer card").show(ui);
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if ui
+                                .add(Key::new("refresh").outline(VALUE).enabled(printer.is_some()))
+                                .clicked()
+                            {
+                                refresh = true;
+                            }
+                        });
+                    });
+                    match status.as_ref().map(|s| &s.card) {
+                        None => note(ui, "No printer is selected.", LEGEND),
+                        Some(None) => note(
+                            ui,
+                            "The card has not been read. Put it in the printer and press refresh.",
+                            LEGEND,
+                        ),
+                        Some(Some(card)) if card.is_empty() => {
+                            note(ui, "The card is empty.", LEGEND)
+                        }
+                        Some(Some(card)) => {
+                            let total: u64 = card.iter().map(|f| f.size).sum();
+                            Line::new()
+                                .note(format!("{} files, {}", card.len(), size_text(total)))
+                                .size(10.5)
+                                .show(ui);
+                            egui::ScrollArea::vertical()
+                                .id_salt("card files")
+                                .auto_shrink([false, false])
+                                .show(ui, |ui| {
+                                    for f in card {
+                                        let queued = jobs.iter().any(|j| {
+                                            removable::on_card(&j.path, std::slice::from_ref(f))
+                                                .is_some()
+                                        });
+                                        ui.horizontal(|ui| {
+                                            ui.vertical(|ui| {
+                                                ui.set_width(
+                                                    (ui.available_width() - 150.0).max(120.0),
+                                                );
+                                                Line::new().value(&f.name).size(12.5).elided(ui);
+                                                Line::new()
+                                                    .note(size_text(f.size))
+                                                    .size(10.0)
+                                                    .show(ui);
+                                            });
+                                            ui.with_layout(
+                                                egui::Layout::right_to_left(egui::Align::Center),
+                                                |ui| {
+                                                    if ui
+                                                        .add(
+                                                            Key::new("delete")
+                                                                .outline(FAULT)
+                                                                .enabled(!busy),
+                                                        )
+                                                        .clicked()
+                                                    {
+                                                        delete = Some(Delete::Card(f.name.clone()));
+                                                    }
+                                                    if ui
+                                                        .add(
+                                                            Key::new("print")
+                                                                .outline(READOUT)
+                                                                .enabled(idle),
+                                                        )
+                                                        .clicked()
+                                                    {
+                                                        print = Some(f.name.clone());
+                                                    }
+                                                    if queued {
+                                                        chip(ui, "queued", OK, true);
+                                                    }
+                                                },
+                                            );
+                                        });
+                                        ui.separator();
+                                    }
+                                });
+                        }
+                    }
+                    let ui = &mut cols[1];
+                    ui.horizontal(|ui| {
+                        let label =
+                            volume.as_ref().map_or("usb stick".to_string(), |v| v.label.clone());
+                        Line::new().legend(&label).show(ui);
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if ui
+                                .add(Key::new("up").outline(VALUE).enabled(!files.dir.is_empty()))
+                                .clicked()
+                            {
+                                go_up = true;
+                            }
+                        });
+                    });
+                    match &files.listing {
+                        None => note(ui, "No USB stick or SD card is mounted.", LEGEND),
+                        Some((_, dir, list)) => {
+                            Line::new().note(dir.display().to_string()).size(10.0).elided(ui);
+                            if list.is_empty() {
+                                note(ui, "This folder is empty.", LEGEND);
+                            }
+                            egui::ScrollArea::vertical()
+                                .id_salt("stick files")
+                                .auto_shrink([false, false])
+                                .show(ui, |ui| {
+                                    for e in list {
+                                        let gcode = !e.dir && gcode::is_gcode(&e.path);
+                                        ui.horizontal(|ui| {
+                                            ui.vertical(|ui| {
+                                                ui.set_width(
+                                                    (ui.available_width() - 190.0).max(120.0),
+                                                );
+                                                let name = if e.dir {
+                                                    format!("{}/", e.name)
+                                                } else {
+                                                    e.name.clone()
+                                                };
+                                                let r =
+                                                    Line::new().value(&name).size(12.5).elided(ui);
+                                                if e.dir && r.interact(Sense::click()).clicked() {
+                                                    go_in = Some(e.name.clone());
+                                                }
+                                                if !e.dir {
+                                                    Line::new()
+                                                        .note(size_text(e.size))
+                                                        .size(10.0)
+                                                        .show(ui);
+                                                }
+                                            });
+                                            ui.with_layout(
+                                                egui::Layout::right_to_left(egui::Align::Center),
+                                                |ui| {
+                                                    if e.dir {
+                                                        if ui
+                                                            .add(Key::new("open").outline(VALUE))
+                                                            .clicked()
+                                                        {
+                                                            go_in = Some(e.name.clone());
+                                                        }
+                                                    } else {
+                                                        if ui
+                                                            .add(Key::new("delete").outline(FAULT))
+                                                            .clicked()
+                                                        {
+                                                            delete = Some(Delete::Stick(
+                                                                e.path.clone(),
+                                                                e.name.clone(),
+                                                            ));
+                                                        }
+                                                        if ui
+                                                            .add(
+                                                                Key::new("queue")
+                                                                    .outline(READOUT)
+                                                                    .enabled(gcode),
+                                                            )
+                                                            .clicked()
+                                                        {
+                                                            queue_path = Some(e.path.clone());
+                                                        }
+                                                    }
+                                                },
+                                            );
+                                        });
+                                        ui.separator();
+                                    }
+                                });
+                        }
+                    }
+                });
+            });
+        if let Some(i) = printer {
+            if refresh {
+                self.list_card(i);
+            }
+            if let Some(name) = print {
+                let size = status
+                    .as_ref()
+                    .and_then(|s| s.card.as_ref())
+                    .and_then(|c| c.iter().find(|f| f.name == name))
+                    .cloned();
+                let job = size.and_then(|f| {
+                    jobs.iter()
+                        .find(|j| removable::on_card(&j.path, std::slice::from_ref(&f)).is_some())
+                });
+                match job {
+                    Some(j) => acts.push(Act::Start(i, j.id)),
+                    None => self.stations[i].send(Control::Gcode(format!("M21\nM23 {name}\nM24"))),
+                }
+            }
+        }
+        if let Some(name) = go_in {
+            files.dir.push(name);
+            files.listing = None;
+        }
+        if go_up {
+            files.dir.pop();
+            files.listing = None;
+        }
+        if let Some(path) = queue_path {
+            self.enqueue(&path, None);
+        }
+        if delete.is_some() {
+            files.confirm = delete;
+        }
+        if let Some(what) = &files.confirm {
+            let name = match what {
+                Delete::Card(n) | Delete::Stick(_, n) => n.clone(),
+            };
+            let (mut yes, mut no) = (false, false);
+            let m = egui::Modal::new(Id::new("delete file")).show(ctx, |ui| {
+                ui.set_width(380.0);
+                modal_title(ui, &format!("Delete {name}?"));
+                let said = match what {
+                    Delete::Card(_) => "It is removed from the printer's card and cannot be undone. A queued job that was using it is sent over serial next time.",
+                    Delete::Stick(..) => "It is removed from the stick and cannot be undone.",
+                };
+                note(ui, said, LEGEND);
+                footer(ui, |ui| {
+                    if ui.add(Key::new("delete").solid(FAULT).min_width(100.0)).clicked() {
+                        yes = true;
+                    }
+                    if ui.add(Key::new("keep it").outline(VALUE).min_width(100.0)).clicked() {
+                        no = true;
+                    }
+                });
+            });
+            if yes {
+                match files.confirm.take() {
+                    Some(Delete::Card(n)) => {
+                        if let Some(i) = printer {
+                            self.stations[i].send(Control::Gcode(format!("M30 {n}\nM20")));
+                            for j in self.queue.jobs.iter_mut() {
+                                if j.card.as_deref().is_some_and(|c| c.eq_ignore_ascii_case(&n)) {
+                                    j.card = None;
+                                }
+                            }
+                            self.save_queue();
+                        }
+                    }
+                    Some(Delete::Stick(path, n)) => {
+                        self.notice = Some(match std::fs::remove_file(&path) {
+                            Ok(()) => (true, format!("{n} is deleted")),
+                            Err(e) => (false, format!("{n}: {e}")),
+                        });
+                        files.listing = None;
+                    }
+                    None => {}
+                }
+            } else if no || m.should_close() {
+                files.confirm = None;
+            }
+        }
+        if open {
+            ctx.request_repaint_after(Duration::from_secs(2));
+            self.files = Some(files);
+        }
+    }
+
     fn mesh_window(&mut self, ctx: &egui::Context, acts: &mut Vec<Act>) {
         let Some(id) = self.mesh.clone() else { return };
         let Some(i) = self.config.printers.iter().position(|p| p.id == id) else {
@@ -1206,6 +1855,7 @@ impl eframe::App for App {
     fn ui(&mut self, ui: &mut Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
         self.events();
+        self.media_events();
         if ctx.input(|i| i.viewport().close_requested())
             && !self.sending().is_empty()
             && !self.closing
@@ -1222,6 +1872,11 @@ impl eframe::App for App {
                 bottom: 6,
             }))
             .show(ui, |ui| self.header(ui, &mut acts));
+        if !self.volumes.is_empty() {
+            egui::Panel::top("media")
+                .frame(egui::Frame::NONE.fill(PANEL).inner_margin(egui::Margin::symmetric(12, 6)))
+                .show(ui, |ui| self.media_bar(ui));
+        }
         if let Some((ok, text)) = self.notice.clone() {
             egui::Panel::bottom("notice")
                 .frame(egui::Frame::NONE.fill(CHASSIS).inner_margin(egui::Margin::symmetric(12, 4)))
@@ -1253,9 +1908,11 @@ impl eframe::App for App {
         self.console_window(&ctx, &mut acts);
         self.big_camera_window(&ctx);
         self.mesh_window(&ctx, &mut acts);
+        self.files_window(&ctx, &mut acts);
         self.apply(acts);
         self.editor(&ctx);
         self.confirmations(&ctx);
+        self.media_windows(&ctx);
         self.files(&ctx);
         if self.busy() {
             ctx.request_repaint_after(Duration::from_secs(1));
@@ -1272,6 +1929,7 @@ struct CardData {
     samples: HashMap<String, Vec<f32>>,
     unclear: bool,
     next: Option<crate::printer::Job>,
+    waiting: Vec<String>,
     now: SystemTime,
 }
 
@@ -1403,6 +2061,14 @@ fn progress_hero(ui: &mut Ui, label: &str, fraction: f32, tint: Color32) {
     ui.add_space(4.0);
 }
 
+fn size_text(bytes: u64) -> String {
+    match bytes {
+        0..1_000 => format!("{bytes} B"),
+        1_000..1_000_000 => format!("{:.0} kB", bytes as f64 / 1e3),
+        _ => megabytes(bytes),
+    }
+}
+
 fn megabytes(bytes: u64) -> String {
     format!("{:.1} MB", bytes as f64 / 1e6)
 }
@@ -1526,11 +2192,25 @@ fn printer_info(ui: &mut Ui, d: &CardData, acts: &mut Vec<Act>) {
                 Line::new().legend("now").value(a).elided(ui);
             } else if let Some(job) = &next {
                 Line::new().legend("next").value(&job.name).elided(ui);
+                if let Some(file) = &job.card {
+                    Line::new().note(format!("starts {file} from the card")).size(10.5).elided(ui);
+                }
                 Line::new().note(job_summary(&job.meta)).size(10.5).elided(ui);
                 ui.add_space(4.0);
-                if ui.add(Key::new("start").solid(READOUT).min_width(140.0)).clicked() {
+                let label = if job.card.is_some() { "start from card" } else { "start" };
+                if ui.add(Key::new(label).solid(READOUT).min_width(140.0)).clicked() {
                     acts.push(Act::Start(i, job.id));
                 }
+            } else if !d.waiting.is_empty() {
+                let loaded = config.filament.as_deref().unwrap_or("-");
+                note(
+                    ui,
+                    format!(
+                        "Nothing queued for {loaded}. Jobs are waiting for {}; change the filament to take them.",
+                        d.waiting.join(", ")
+                    ),
+                    WARN,
+                );
             } else {
                 note(
                     ui,
@@ -1560,6 +2240,9 @@ fn printer_info(ui: &mut Ui, d: &CardData, acts: &mut Vec<Act>) {
         });
         if ui.add(Key::new("bed").outline(VALUE).enabled(online)).clicked() {
             acts.push(Act::Mesh(i));
+        }
+        if ui.add(Key::new("files").outline(VALUE).enabled(online)).clicked() {
+            acts.push(Act::Files(i));
         }
         if ui.add(Key::new("console").outline(VALUE)).clicked() {
             acts.push(Act::Console(i));
@@ -1639,6 +2322,9 @@ fn job_summary(meta: &gcode::Meta) -> String {
     }
     if let Some(s) = &meta.slicer {
         parts.push(s.clone());
+    }
+    if let Some(f) = &meta.filament {
+        parts.insert(0, f.clone());
     }
     if parts.is_empty() {
         parts.push(format!("{} commands", meta.commands));

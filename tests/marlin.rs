@@ -12,7 +12,15 @@ fn job(id: u64, name: &str, body: &str) -> Job {
     std::fs::create_dir_all(&dir).unwrap();
     let path: PathBuf = dir.join(format!("{name}.gcode"));
     std::fs::write(&path, body).unwrap();
-    Job { id, name: name.into(), path, printer: None, added: 0, meta: Default::default() }
+    Job {
+        id,
+        name: name.into(),
+        path,
+        printer: None,
+        added: 0,
+        meta: Default::default(),
+        card: None,
+    }
 }
 
 fn part(lines: usize) -> String {
@@ -142,9 +150,7 @@ fn a_slicer_heating_wait_keeps_the_label_up() {
     m.start(job(21, "heat-wait", body)).unwrap();
     let mut ev = Vec::new();
     until(&mut m, &mut ev, "the copy", |_, ev| on_printer(ev));
-    until(&mut m, &mut ev, "the heating wait", |m, _| {
-        m.status().activity == Some("heating")
-    });
+    until(&mut m, &mut ev, "the heating wait", |m, _| m.status().activity == Some("heating"));
     let t = Instant::now();
     while t.elapsed() < Duration::from_secs(1) {
         m.step(&mut ev);
@@ -380,4 +386,95 @@ fn probing_reads_the_mesh_and_turns_leveling_on() {
     m.gcode("M420 S0").unwrap();
     until(&mut m, &mut ev, "leveling off", |m, _| m.status().leveling.enabled == Some(false));
     assert!(m.status().activity.is_none());
+}
+
+#[test]
+fn a_job_already_on_the_card_is_started_without_sending_it() {
+    let body = commands(&part(300));
+    let (mut m, b) = connected(Script {
+        sd_lines_per_s: 40.0,
+        files: vec![("ORDER.GCO".into(), body)],
+        ..Default::default()
+    });
+    let mut j = job(3, "order", &part(300));
+    j.card = Some("ORDER.GCO".into());
+    m.start(j).unwrap();
+    let mut ev = Vec::new();
+    until(&mut m, &mut ev, "the print to start", |_, ev| on_printer(ev));
+    assert!(!b.sim.seen.lock().unwrap().commands.iter().any(|c| c.starts_with("M28")));
+    until(&mut m, &mut ev, "progress from the card", |m, _| {
+        m.status().progress.as_ref().is_some_and(|p| p.done > 0 && !p.sending)
+    });
+    until(&mut m, &mut ev, "the print to end", |_, ev| finished(ev).is_some());
+    assert_eq!(finished(&ev).unwrap().0, Outcome::Done);
+    for _ in 0..30 {
+        m.step(&mut ev);
+    }
+    assert!(b.sim.card.lock().unwrap().files.contains_key("ORDER.GCO"));
+    assert!(!b.sim.seen.lock().unwrap().commands.iter().any(|c| c.starts_with("M30")));
+}
+
+#[test]
+fn a_job_missing_from_the_card_goes_back_to_being_sent() {
+    let (mut m, _b) = connected(Script::default());
+    let mut j = job(4, "gone", &part(10));
+    j.card = Some("GONE.GCO".into());
+    m.start(j).unwrap();
+    let mut ev = Vec::new();
+    until(&mut m, &mut ev, "the refusal", |_, ev| interrupted(ev).is_some());
+    assert!(interrupted(&ev).unwrap().contains("sent over serial"));
+    assert_eq!(m.status().state(), State::Idle);
+    assert!(m.status().progress.is_none());
+    let back = ev
+        .iter()
+        .find_map(|e| match e {
+            Event::Interrupted(j, _) => Some(j.clone()),
+            _ => None,
+        })
+        .unwrap();
+    assert_eq!(back.card, None);
+}
+
+#[test]
+fn the_printers_card_is_listed() {
+    let (mut m, _b) = connected(Script {
+        files: vec![
+            ("BENCHY.GCO".into(), "G28\n".into()),
+            ("A.GCO".into(), "G1 X1\nG1 X2\n".into()),
+        ],
+        ..Default::default()
+    });
+    let mut ev = Vec::new();
+    until(&mut m, &mut ev, "the listing", |m, _| m.status().card.is_some());
+    let card = m.status().card.clone().unwrap();
+    let names: Vec<(&str, u64)> = card.iter().map(|f| (f.name.as_str(), f.size)).collect();
+    assert_eq!(names, [("A.GCO", 12), ("BENCHY.GCO", 4)]);
+}
+
+#[test]
+fn no_card_means_no_listing() {
+    let (mut m, _b) = connected(Script { no_card: true, ..Default::default() });
+    let mut ev = Vec::new();
+    for _ in 0..40 {
+        m.step(&mut ev);
+    }
+    assert!(m.status().card.is_none());
+}
+
+#[test]
+fn deleting_a_file_from_the_card_updates_the_listing() {
+    let (mut m, b) = connected(Script {
+        files: vec![("A.GCO".into(), "G28\n".into()), ("B.GCO".into(), "G1 X1\n".into())],
+        ..Default::default()
+    });
+    let mut ev = Vec::new();
+    until(&mut m, &mut ev, "the listing", |m, _| {
+        m.status().card.as_ref().is_some_and(|c| c.len() == 2)
+    });
+    m.gcode("M30 A.GCO\nM20").unwrap();
+    until(&mut m, &mut ev, "the new listing", |m, _| {
+        m.status().card.as_ref().is_some_and(|c| c.len() == 1)
+    });
+    assert_eq!(m.status().card.as_ref().unwrap()[0].name, "B.GCO");
+    assert!(!b.sim.card.lock().unwrap().files.contains_key("A.GCO"));
 }

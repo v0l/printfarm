@@ -53,6 +53,8 @@ pub struct Job {
     pub added: u64,
     #[serde(default)]
     pub meta: Meta,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub card: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -107,6 +109,12 @@ impl Foreign {
     }
 }
 
+#[derive(Clone, Debug, PartialEq)]
+pub struct CardFile {
+    pub name: String,
+    pub size: u64,
+}
+
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Status {
     pub state: Option<State>,
@@ -119,6 +127,7 @@ pub struct Status {
     pub activity: Option<&'static str>,
     pub leveling: mesh::Leveling,
     pub foreign: Option<Foreign>,
+    pub card: Option<Vec<CardFile>>,
 }
 
 impl Status {
@@ -200,6 +209,7 @@ mod tests {
                 printer: None,
                 added: 0,
                 meta: Meta { estimate_s: estimate, ..Meta::default() },
+                card: None,
             },
             done,
             total: 100,

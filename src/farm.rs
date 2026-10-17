@@ -68,7 +68,15 @@ impl Queue {
         }
         self.next_id = self.next_id.max(self.jobs.iter().map(|j| j.id).max().unwrap_or(0)) + 1;
         let name = path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
-        self.jobs.push(Job { id: self.next_id, name, path, printer, added: now(), meta });
+        self.jobs.push(Job {
+            id: self.next_id,
+            name,
+            path,
+            printer,
+            added: now(),
+            meta,
+            card: None,
+        });
         Ok(self.next_id)
     }
 
@@ -94,8 +102,44 @@ impl Queue {
         }
     }
 
-    pub fn next_for(&self, printer: &str) -> Option<&Job> {
-        self.jobs.iter().find(|j| j.printer.as_deref().is_none_or(|p| p == printer))
+    pub fn next_for(&self, printer: &str, loaded: Option<&str>) -> Option<&Job> {
+        self.jobs.iter().find(|j| for_printer(j, printer) && fits(j, loaded))
+    }
+
+    pub fn waiting_for_filament(&self, printer: &str, loaded: Option<&str>) -> Vec<String> {
+        let mut out: Vec<String> = self
+            .jobs
+            .iter()
+            .filter(|j| for_printer(j, printer) && !fits(j, loaded))
+            .filter_map(|j| j.meta.filament.clone())
+            .collect();
+        out.sort();
+        out.dedup();
+        out
+    }
+
+    pub fn fill_in(&mut self) -> bool {
+        let mut changed = false;
+        for j in self.jobs.iter_mut().filter(|j| j.meta.filament.is_none()) {
+            if let Ok(meta) = gcode::scan(&j.path)
+                && meta.filament.is_some()
+            {
+                j.meta.filament = meta.filament;
+                changed = true;
+            }
+        }
+        changed
+    }
+}
+
+fn for_printer(job: &Job, printer: &str) -> bool {
+    job.printer.as_deref().is_none_or(|p| p == printer)
+}
+
+pub fn fits(job: &Job, loaded: Option<&str>) -> bool {
+    match (job.meta.filament.as_deref(), loaded) {
+        (Some(want), Some(have)) => want.eq_ignore_ascii_case(have),
+        _ => true,
     }
 }
 
@@ -176,19 +220,42 @@ mod tests {
         let b = q.add(&dir.join("b.gcode"), None).unwrap();
         let c = q.add(&dir.join("c.gcode"), Some("prusa".into())).unwrap();
         assert!(q.add(&dir.join("notes.txt"), None).is_err());
-        assert_eq!(q.next_for("ender").map(|j| j.id), Some(a));
-        assert_eq!(q.next_for("prusa").map(|j| j.id), Some(b));
+        assert_eq!(q.next_for("ender", None).map(|j| j.id), Some(a));
+        assert_eq!(q.next_for("prusa", None).map(|j| j.id), Some(b));
         q.shift(c, -5);
         assert_eq!(q.jobs.iter().map(|j| j.id).collect::<Vec<_>>(), [c, a, b]);
-        assert_eq!(q.next_for("prusa").map(|j| j.id), Some(c));
+        assert_eq!(q.next_for("prusa", None).map(|j| j.id), Some(c));
         q.take(c);
         q.assign(a, None);
-        assert_eq!(q.next_for("prusa").map(|j| j.id), Some(a));
+        assert_eq!(q.next_for("prusa", None).map(|j| j.id), Some(a));
         let path = dir.join("queue.json");
         q.save(&path).unwrap();
         assert_eq!(Queue::load(&path).unwrap(), q);
         let d = q.add(&dir.join("c.gcode"), None).unwrap();
         assert!(d > c);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn printers_only_take_the_filament_they_have_loaded() {
+        let dir = scratch("filament");
+        let body = |f: &str| format!("G28\nG1 X1\n; filament_type = {f}\n");
+        std::fs::write(dir.join("petg.gcode"), body("PETG")).unwrap();
+        std::fs::write(dir.join("pla.gcode"), body("PLA")).unwrap();
+        std::fs::write(dir.join("any.gcode"), "G28\n").unwrap();
+        let mut q = Queue::default();
+        let petg = q.add(&dir.join("petg.gcode"), None).unwrap();
+        let pla = q.add(&dir.join("pla.gcode"), None).unwrap();
+        let any = q.add(&dir.join("any.gcode"), None).unwrap();
+        assert_eq!(q.next_for("a", Some("pla")).map(|j| j.id), Some(pla));
+        assert_eq!(q.next_for("b", Some("PETG")).map(|j| j.id), Some(petg));
+        assert_eq!(q.next_for("c", None).map(|j| j.id), Some(petg));
+        assert_eq!(q.next_for("d", Some("TPU")).map(|j| j.id), Some(any));
+        assert_eq!(q.waiting_for_filament("d", Some("TPU")), ["PETG", "PLA"]);
+        assert!(q.waiting_for_filament("c", None).is_empty());
+        q.jobs[0].meta.filament = None;
+        assert!(q.fill_in());
+        assert_eq!(q.jobs[0].meta.filament.as_deref(), Some("PETG"));
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -203,6 +270,7 @@ mod tests {
             printer: None,
             added: 0,
             meta: gcode::Meta { filament_g: Some(12.0), ..Default::default() },
+            card: None,
         };
         append(&path, &Record::new(&job, "Ender", 100, Outcome::Done, "")).unwrap();
         append(&path, &Record::new(&job, "Ender", 200, Outcome::Cancelled, "cancelled")).unwrap();

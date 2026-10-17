@@ -48,6 +48,51 @@ the slicer's estimate with the rate so far.
 
 Right click a print in the history to queue it again.
 
+## SD cards and USB sticks
+
+When a removable volume is mounted (a USB stick, or an SD card in a reader), a
+bar appears under the header with its label, size and free space. "copy queue"
+lists the queued jobs, all ticked; the ones you keep are copied to the top
+folder of the card as 8.3 names (`BENCHY.GCO`, or `BENCHY~2.GCO` if a different
+file already has that name), since that is what the printer's firmware opens.
+A file already on the card with the same contents is not copied again. Each
+file is written as `.part` and renamed when whole, so stopping the copy leaves
+no half file.
+
+The jobs stay in the queue, marked "on card". Put the card in the printer and
+start the job from the printer's card: printfarm sends `M23` and `M24` over
+serial instead of copying the file, and tracks progress, pause and cancel as
+usual. printfarm also lists the printer's own card (`M20`, on connecting and every 30
+seconds while idle). A queued job with a file of exactly the same size there (the
+name is only used to choose between files of equal size, since the firmware
+shortens long names to `BASE~1.GCO`) is started from the card even if printfarm
+did not copy it, and a job marked on
+card that is no longer there is sent over serial. If the printer cannot find the
+file anyway, the job goes back to the top of the
+queue as a normal job and is sent over serial. Files on a card you copied are
+never deleted by printfarm.
+
+"eject" syncs and unmounts the volume (`udisksctl`, then `umount`) and reports
+when it is safe to pull out. Volumes are found on Linux from
+`/proc/self/mountinfo` and `/sys`: anything on a USB bus, flagged removable, or
+an SD card. Internal disks and `/boot` are never listed. macOS and Windows do
+not list volumes yet.
+
+## File manager
+
+"files" on a printer card opens two lists side by side. The left one is the
+printer's own SD card, read with `M20`: every file with its size, a "queued"
+mark where a queued job matches it, "print" (starts it from the card, and uses
+the queued job's progress and history when one matches) and "delete" (`M30`,
+after asking). "refresh" reads the card again. Print and delete are off while
+the printer is busy, and print is also off while the bed is waiting to be
+cleared.
+
+The right one is the mounted USB stick or SD card, with folders you can open,
+"queue" for a G-code file and "delete" (after asking). "browse" in the bar
+opens the same window. It lists the printer's card only for a connected
+printer.
+
 ## Bed
 
 "bed" on a card shows the printer's mesh as a map, back at the top and front

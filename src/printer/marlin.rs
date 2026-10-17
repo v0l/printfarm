@@ -1,5 +1,7 @@
 use super::mesh::{GridReader, Mesh, grid_title};
-use super::{Dir, Event, Foreign, Heater, Job, Outcome, Printer, Progress, State, Status};
+use super::{
+    CardFile, Dir, Event, Foreign, Heater, Job, Outcome, Printer, Progress, State, Status,
+};
 use crate::gcode;
 use serialport::SerialPort;
 use std::collections::VecDeque;
@@ -12,6 +14,7 @@ const PROBE_EVERY: Duration = Duration::from_secs(2);
 const PROBE_TRIES: u32 = 4;
 const POLL_EVERY: Duration = Duration::from_secs(2);
 const SD_POLL_BUSY: Duration = Duration::from_secs(3);
+const CARD_POLL: Duration = Duration::from_secs(30);
 const SD_POLL_IDLE: Duration = Duration::from_secs(10);
 const QUIET_POLL: Duration = Duration::from_secs(10);
 const HEAT_EXPIRY: Duration = Duration::from_secs(3);
@@ -48,6 +51,7 @@ enum Handshake {
 }
 
 enum Phase {
+    Selecting,
     Opening(BufReader<File>),
     Sending(BufReader<File>),
     Closing,
@@ -60,6 +64,7 @@ struct Running {
     phase: Phase,
     layers: Vec<u64>,
     bytes: u64,
+    card: bool,
 }
 
 impl Running {
@@ -97,6 +102,8 @@ pub struct Marlin {
     poked: bool,
     pending: Vec<Event>,
     grid: Option<GridReader>,
+    listing: Option<Vec<CardFile>>,
+    last_card_poll: Instant,
 }
 
 impl Marlin {
@@ -131,6 +138,8 @@ impl Marlin {
             poked: false,
             pending: Vec::new(),
             grid: None,
+            listing: None,
+            last_card_poll: now,
         }
     }
 
@@ -259,6 +268,23 @@ impl Marlin {
     }
 
     fn line(&mut self, line: &str, events: &mut Vec<Event>) {
+        if line.starts_with("Begin file list") {
+            self.listing = Some(Vec::new());
+            return;
+        }
+        if let Some(list) = self.listing.as_mut() {
+            if line.starts_with("End file list") {
+                self.status.card = self.listing.take();
+                return;
+            }
+            if let Some(file) = card_file(line) {
+                list.push(file);
+                return;
+            }
+        }
+        if line.contains("No SD card") || line.contains("SD init fail") {
+            self.status.card = None;
+        }
         if let Some(g) = self.grid.as_mut() {
             if g.feed(line) {
                 events.push(Event::Console(Dir::Received, line.to_string()));
@@ -374,6 +400,19 @@ impl Marlin {
             return;
         }
         match run.phase {
+            Phase::Selecting => {
+                self.manual.clear();
+                if let Some(mut run) = self.job.take() {
+                    run.progress.job.card = None;
+                    let why = format!(
+                        "{} is not on the printer's card, it will be sent over serial instead",
+                        run.file
+                    );
+                    events.push(Event::Interrupted(run.progress.job, why));
+                }
+                self.status.progress = None;
+                self.status.state = Some(State::Idle);
+            }
             Phase::Opening(_) => {
                 self.manual.clear();
                 self.interrupt("the printer could not write the file to its SD card", events);
@@ -480,7 +519,9 @@ impl Marlin {
         }
         match was {
             Some(Kind::Open) => {
-                if let Some(run) = self.job.as_mut() {
+                if self.job.as_ref().is_some_and(|r| matches!(r.phase, Phase::Selecting)) {
+                    self.begin_from_card(events);
+                } else if let Some(run) = self.job.as_mut() {
                     run.phase = match std::mem::replace(&mut run.phase, Phase::Closing) {
                         Phase::Opening(reader) => Phase::Sending(reader),
                         other => other,
@@ -509,7 +550,11 @@ impl Marlin {
         self.manual.push_back(Queued::Plain("M420 V".into()));
         if self.sd_cap != Some(false) {
             self.polls.extend(["M27 C", "M27"]);
+            if self.job.is_none() {
+                self.polls.push_back("M20");
+            }
             self.last_sd_poll = Instant::now();
+            self.last_card_poll = Instant::now();
         }
         self.status.state = Some(if self.job.is_some() { State::Printing } else { State::Idle });
     }
@@ -527,6 +572,15 @@ impl Marlin {
         let file = run.file.clone();
         self.status.progress = Some(run.progress.clone());
         self.manual.push_back(Queued::Plain(format!("M23 {file}")));
+        self.manual.push_back(Queued::Plain("M24".into()));
+        events.push(Event::OnPrinter(run.progress.job.clone()));
+    }
+
+    fn begin_from_card(&mut self, events: &mut Vec<Event>) {
+        let Some(run) = self.job.as_mut() else { return };
+        run.phase = Phase::OnPrinter;
+        run.progress.started = SystemTime::now();
+        self.status.progress = Some(run.progress.clone());
         self.manual.push_back(Queued::Plain("M24".into()));
         events.push(Event::OnPrinter(run.progress.job.clone()));
     }
@@ -549,7 +603,9 @@ impl Marlin {
 
     fn interrupt(&mut self, why: &str, events: &mut Vec<Event>) {
         if let Some(run) = self.job.take() {
-            self.cleanup.push(run.file);
+            if !run.card {
+                self.cleanup.push(run.file);
+            }
             events.push(Event::Interrupted(run.progress.job, why.to_string()));
         }
         self.status.progress = None;
@@ -560,7 +616,7 @@ impl Marlin {
 
     fn end_job(&mut self, outcome: Outcome, reason: &str, events: &mut Vec<Event>) {
         if let Some(run) = self.job.take() {
-            if !run.uploading() {
+            if !run.uploading() && !run.card {
                 self.manual.push_back(Queued::Plain(format!("M30 {}", run.file)));
             }
             events.push(Event::Finished {
@@ -648,6 +704,11 @@ impl Marlin {
         } else {
             SD_POLL_IDLE
         };
+        let idle = self.job.is_none() && self.status.foreign.is_none();
+        if self.sd_cap != Some(false) && idle && self.last_card_poll.elapsed() > CARD_POLL {
+            self.last_card_poll = Instant::now();
+            self.polls.push_back("M20");
+        }
         if self.sd_cap != Some(false) && self.last_sd_poll.elapsed() > every {
             self.last_sd_poll = Instant::now();
             self.polls.extend(["M27 C", "M27"]);
@@ -693,8 +754,10 @@ impl Marlin {
         self.resend_from = None;
         self.manual.clear();
         self.manual.push_back(Queued::Resync);
-        self.manual.push_back(Queued::Plain("M29".into()));
-        self.manual.push_back(Queued::Plain(format!("M30 {}", run.file)));
+        if !run.card {
+            self.manual.push_back(Queued::Plain("M29".into()));
+            self.manual.push_back(Queued::Plain(format!("M30 {}", run.file)));
+        }
         self.status.progress = None;
         self.status.state = Some(State::Idle);
         Some(run)
@@ -769,6 +832,33 @@ impl Printer for Marlin {
         if self.sd_cap == Some(false) {
             return Err("this printer has no SD card to print from".into());
         }
+        if let Some(name) = job.card.clone() {
+            let (layers, bytes) = gcode::upload_layers(&job.path).unwrap_or_default();
+            let progress = Progress {
+                job,
+                done: 0,
+                total: 0,
+                layer: 0,
+                started: SystemTime::now(),
+                paused: Duration::ZERO,
+                paused_since: None,
+                sending: false,
+            };
+            self.status.progress = Some(progress.clone());
+            self.status.message = None;
+            self.manual.push_back(Queued::Plain("M21".into()));
+            self.manual.push_back(Queued::Kinded(format!("M23 {name}"), Kind::Open));
+            self.job = Some(Running {
+                progress,
+                file: name,
+                phase: Phase::Selecting,
+                layers,
+                bytes,
+                card: true,
+            });
+            self.status.state = Some(State::Printing);
+            return Ok(());
+        }
         let (layers, total) =
             gcode::upload_layers(&job.path).map_err(|e| format!("{}: {e}", job.path.display()))?;
         let file = File::open(&job.path).map_err(|e| format!("{}: {e}", job.path.display()))?;
@@ -793,6 +883,7 @@ impl Printer for Marlin {
             phase: Phase::Opening(BufReader::with_capacity(1 << 16, file)),
             layers,
             bytes: total,
+            card: false,
         });
         self.status.state = Some(State::Printing);
         Ok(())
@@ -860,8 +951,12 @@ impl Printer for Marlin {
 
     fn adopt(&mut self, job: Job, started: SystemTime, on_printer: bool) {
         let file = sd_name(job.id);
+        let card = job.card.is_some();
+        let file = job.card.clone().unwrap_or(file);
         if !on_printer {
-            self.cleanup.push(file);
+            if !card {
+                self.cleanup.push(file);
+            }
             self.pending
                 .push(Event::Interrupted(job, "printfarm closed while it was being sent".into()));
             return;
@@ -878,7 +973,7 @@ impl Printer for Marlin {
             sending: false,
         };
         self.status.progress = Some(progress.clone());
-        self.job = Some(Running { progress, file, phase: Phase::OnPrinter, layers, bytes });
+        self.job = Some(Running { progress, file, phase: Phase::OnPrinter, layers, bytes, card });
         self.away = true;
     }
 
@@ -914,6 +1009,14 @@ fn activity(cmd: &str) -> Option<&'static str> {
         "M600" => Some("waiting for a filament change"),
         _ => None,
     }
+}
+
+fn card_file(line: &str) -> Option<CardFile> {
+    let mut words = line.split_whitespace();
+    let name = words.next()?;
+    let size = words.next()?.parse().ok()?;
+    (words.next().is_none() && !name.ends_with('/'))
+        .then(|| CardFile { name: name.to_string(), size })
 }
 
 fn resend_request(line: &str) -> Option<u32> {
@@ -1115,6 +1218,7 @@ mod tests {
                     printer: None,
                     added: 0,
                     meta: Default::default(),
+                    card: None,
                 },
                 done: 10,
                 total: 100,
@@ -1128,6 +1232,7 @@ mod tests {
             phase: Phase::OnPrinter,
             layers: Vec::new(),
             bytes: 100,
+            card: false,
         });
         m
     }

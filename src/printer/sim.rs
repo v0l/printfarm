@@ -120,7 +120,9 @@ fn wait_for_heat(
             break;
         }
         say(port, &format!("{} W:?", heat.report()));
-        if let Some(at) = *autoreport && at.elapsed() > Duration::from_millis(300) {
+        if let Some(at) = *autoreport
+            && at.elapsed() > Duration::from_millis(300)
+        {
             say(port, &format!(" {}", heat.report()));
             *autoreport = Some(Instant::now());
         }
@@ -191,6 +193,9 @@ pub fn spawn(mut port: TTYPort, mut script: Script) -> Sim {
             {
                 let mut c = sd.lock().unwrap();
                 let mut done = None;
+                if !c.open.as_ref().is_some_and(|o| o.printing) {
+                    sd_due = 0.0;
+                }
                 if let Some(open) = c.open.clone().filter(|o| o.printing) {
                     let data = c.files.get(&open.name).cloned().unwrap_or_default();
                     let mut pos = open.pos;
@@ -335,6 +340,16 @@ pub fn spawn(mut port: TTYPort, mut script: Script) -> Sim {
                         continue;
                     }
                     ("M155", _) => autoreport = Some(Instant::now()),
+                    ("M20", _) if script.no_card => say(&mut port, "echo:No SD card"),
+                    ("M20", _) => {
+                        say(&mut port, "Begin file list");
+                        let mut names: Vec<_> = c.files.iter().collect();
+                        names.sort();
+                        for (name, body) in names {
+                            say(&mut port, &format!("{name} {}", body.len()));
+                        }
+                        say(&mut port, "End file list");
+                    }
                     ("M21", _) if script.no_card => say(&mut port, "echo:No SD card"),
                     ("M21", _) => say(&mut port, "echo:SD card ok"),
                     ("M28", _) if script.no_card => {
