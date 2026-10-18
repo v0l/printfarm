@@ -4,7 +4,6 @@ use crate::station::Wake;
 use std::fs::File;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -159,6 +158,7 @@ fn failure(output: &std::process::Output) -> String {
 
 #[cfg(target_os = "linux")]
 pub fn eject(v: &Volume) -> Result<String, String> {
+    use std::process::Command;
     let _ = Command::new("sync").status();
     let udisks = Command::new("udisksctl")
         .args(["unmount", "--no-user-interaction", "-b", &v.device])

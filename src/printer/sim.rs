@@ -176,7 +176,7 @@ pub fn spawn_pty(link: &std::path::Path, script: Script) -> std::io::Result<Pty>
     let flag = stop.clone();
     std::thread::spawn(move || {
         while !flag.load(Ordering::Relaxed) {
-            unsafe { libc::ioctl(keep.as_raw_fd(), libc::TIOCNXCL) };
+            unsafe { libc::ioctl(keep.as_raw_fd(), libc::TIOCNXCL as _) };
             std::thread::sleep(Duration::from_secs(1));
         }
     });
