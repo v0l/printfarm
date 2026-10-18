@@ -102,6 +102,49 @@ heating the bed first if you pick a temperature, since a bed moves as it heats.
 It is only offered on an idle printer whose bed is marked clear. "save" sends
 `M500`, which stores every setting, so it asks first.
 
+## Printers tab
+
+Every printer has an id, a short tag such as `P01` that is filled in when the
+printer is added and can be changed in the editor (up to 8 characters, no
+spaces, unique). It is shown on the row and card, in the queue's printer
+picker, in notices and in the history.
+
+Each printer is one row: state, the job (or what it is waiting for), a progress
+bar with the time left, and the control that fits, which is pause and cancel
+while printing, start when a job is ready, "bed is clear" after a print, or
+reconnect after a fault. The header counts printers by state. "details" opens
+the full card for that printer, with temperatures, the bed mesh, camera, files,
+console and filament, and "hide" folds it back. "expand all" and "collapse all"
+do every printer at once. Rows start collapsed.
+
+## Preview
+
+"preview" on a queued job, or on a printer card while it prints, draws the
+part from the G-code itself, so it works for any slicer and for files with no
+embedded thumbnail. Each run of extrusion moves is swept into a rounded bead as
+wide and as tall as the slicer's layer, with mitred corners, lit by egui_bench's
+`viewer3d` on wgpu. Drag to turn it, shift-drag to pan, scroll to zoom, use the
+slider to look at the part up to a layer, "top" for a plan view. Travel moves
+and retracts are not drawn.
+
+Opened from a printer that is running that file, the window follows the print:
+only what has been printed is drawn, the bead being printed now is orange, and
+the camera layer tracks it. Drag the slider to stop following and "follow" to
+resume; "show rest" draws the unprinted part faintly. The position comes from
+the printer's own byte count (`M27`), so a slow first layer moves it slowly.
+
+Big files are simplified so the window stays smooth: straight runs are merged,
+then each run of moves that keeps one heading is simplified within a tolerance
+that grows until the file has at most about 140,000 beads, but never past
+0.2 mm, so infill lines and gyroid waves keep their shape. A 69 MB file with 2.4
+million moves reads in under a second and draws about 9 million vertices. The
+purge line drawn before the first layer is left out.
+
+Queued jobs show a picture of the part. The slicer's embedded thumbnail is used
+when there is one; otherwise the part is drawn from its moves in the background
+when it is queued and cached in `thumbs/`. The window needs a GPU with Vulkan,
+Metal or DX12; printfarm now runs on wgpu instead of glow.
+
 ## Camera
 
 Give a printer a camera URL: a JPEG snapshot that is polled once a second, or
@@ -114,8 +157,10 @@ an MJPEG stream (`multipart/x-mixed-replace`), such as mjpg-streamer's
 |---|---|---|---|
 | `printers.toml` | `~/.config/printfarm` | `~/Library/Application Support/printfarm` | `%APPDATA%\printfarm` |
 | `queue.json`, `history.jsonl` | `~/.local/share/printfarm` | `~/Library/Application Support/printfarm` | `%APPDATA%\printfarm` |
+| `thumbs/` | `~/.local/share/printfarm` | `~/Library/Application Support/printfarm` | `%APPDATA%\printfarm` |
 
-`PRINTFARM_HOME` puts all three in one folder instead.
+`PRINTFARM_HOME` puts them all in one folder instead. `thumbs/` holds the queue's part
+pictures drawn from G-code that has no slicer thumbnail; it is safe to delete.
 
 ```toml
 [[printer]]
@@ -137,6 +182,18 @@ printfarm info FILE      # what the slicer wrote into a G-code file
 ```
 
 ## Development
+
+```sh
+printfarm demo [--printers 12]   # a window of simulated printers, nothing touches your config
+```
+
+`demo` starts that many simulated Marlin printers (up to 40) in a scratch
+folder and opens the window on them. The first twelve are scripted: prints at
+different points, one paused, one finished and waiting for the bed to be
+cleared, one with a file already on its card, one that hits a thermal runaway
+after 30 seconds, one that halts after 6, one offline, one waiting for another
+filament, and a history that includes failed and cancelled prints. The folder
+is removed when the window closes.
 
 ```sh
 cargo test

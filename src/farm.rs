@@ -120,8 +120,17 @@ impl Queue {
 
     pub fn fill_in(&mut self) -> bool {
         let mut changed = false;
-        for j in self.jobs.iter_mut().filter(|j| j.meta.filament.is_none()) {
-            if let Ok(meta) = gcode::scan(&j.path)
+        for j in self.jobs.iter_mut() {
+            let size = std::fs::metadata(&j.path).map(|m| m.len()).ok();
+            if size.is_some_and(|s| s != j.meta.bytes)
+                && let Ok(meta) = gcode::scan(&j.path)
+                && meta.commands > 0
+            {
+                j.meta = meta;
+                j.card = None;
+                changed = true;
+            } else if j.meta.filament.is_none()
+                && let Ok(meta) = gcode::scan(&j.path)
                 && meta.filament.is_some()
             {
                 j.meta.filament = meta.filament;
@@ -256,6 +265,28 @@ mod tests {
         q.jobs[0].meta.filament = None;
         assert!(q.fill_in());
         assert_eq!(q.jobs[0].meta.filament.as_deref(), Some("PETG"));
+        assert!(!q.fill_in());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_job_whose_file_was_sliced_again_is_read_again() {
+        let dir = scratch("reslice");
+        let path = dir.join("part.gcode");
+        std::fs::write(&path, "G28\nG1 X1\n; filament_type = PLA\n").unwrap();
+        let mut q = Queue::default();
+        let id = q.add(&path, None).unwrap();
+        q.jobs[0].card = Some("PART.GCO".into());
+        assert!(!q.fill_in());
+        assert_eq!(q.jobs[0].card.as_deref(), Some("PART.GCO"));
+        std::fs::write(&path, "G28\nG1 X1\nG1 X2\nG1 X3\n; filament_type = PETG\n").unwrap();
+        assert!(q.fill_in());
+        let job = q.find(id).unwrap();
+        assert_eq!(job.meta.commands, 4);
+        assert_eq!(job.meta.filament.as_deref(), Some("PETG"));
+        assert_eq!(job.meta.bytes, std::fs::metadata(&path).unwrap().len());
+        assert_eq!(job.card, None);
+        assert!(!q.fill_in());
         std::fs::remove_dir_all(&dir).ok();
     }
 

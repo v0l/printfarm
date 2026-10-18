@@ -17,6 +17,10 @@ pub struct Script {
     pub no_card: bool,
     pub files: Vec<(String, String)>,
     pub printing: Option<String>,
+    pub start_at: f32,
+    pub paused: bool,
+    pub heated: Option<(f32, f32)>,
+    pub fault_after: Option<(Duration, String)>,
 }
 
 #[derive(Default)]
@@ -142,6 +146,43 @@ const MESH: [[f32; 5]; 5] = [
     [0.418, 0.158, -0.023, -0.183, -0.287],
 ];
 
+pub struct Pty {
+    _sim: Sim,
+    stop: Arc<AtomicBool>,
+}
+
+impl Drop for Pty {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+    }
+}
+
+pub fn spawn_pty(link: &std::path::Path, script: Script) -> std::io::Result<Pty> {
+    use serialport::SerialPort;
+    use std::os::fd::AsRawFd;
+    use std::os::unix::fs::OpenOptionsExt;
+    let (printer, host) = TTYPort::pair().map_err(std::io::Error::other)?;
+    let path = host.name().ok_or_else(|| std::io::Error::other("no pty name"))?;
+    let keep = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .custom_flags(libc::O_NOCTTY)
+        .open(&path)?;
+    drop(host);
+    let _ = std::fs::remove_file(link);
+    std::os::unix::fs::symlink(&path, link)?;
+    let sim = spawn(printer, script);
+    let stop = Arc::new(AtomicBool::new(false));
+    let flag = stop.clone();
+    std::thread::spawn(move || {
+        while !flag.load(Ordering::Relaxed) {
+            unsafe { libc::ioctl(keep.as_raw_fd(), libc::TIOCNXCL) };
+            std::thread::sleep(Duration::from_secs(1));
+        }
+    });
+    Ok(Pty { _sim: sim, stop })
+}
+
 pub fn spawn(mut port: TTYPort, mut script: Script) -> Sim {
     let seen = Arc::new(Mutex::new(Seen::default()));
     let card = Arc::new(Mutex::new(Card::default()));
@@ -151,7 +192,13 @@ pub fn spawn(mut port: TTYPort, mut script: Script) -> Sim {
             c.files.insert(name.to_ascii_uppercase(), body.clone().into_bytes());
         }
         if let Some(name) = &script.printing {
-            c.open = Some(Open { name: name.to_ascii_uppercase(), pos: 0, printing: true });
+            let name = name.to_ascii_uppercase();
+            let data = c.files.get(&name).cloned().unwrap_or_default();
+            let mut pos = ((data.len() as f32) * script.start_at.clamp(0.0, 0.99)) as usize;
+            while pos > 0 && pos < data.len() && data[pos - 1] != b'\n' {
+                pos += 1;
+            }
+            c.open = Some(Open { name, pos, printing: !script.paused });
         }
     }
     let stop = Arc::new(AtomicBool::new(false));
@@ -168,7 +215,10 @@ pub fn spawn(mut port: TTYPort, mut script: Script) -> Sim {
         let mut probed = false;
         let mut sd_clock = Instant::now();
         let mut sd_due = 0.0f32;
-        let mut heat = Heaters { hotend: (21.0, 0.0), bed: (21.0, 0.0), at: Instant::now() };
+        let (hot, bed) = script.heated.unwrap_or((0.0, 0.0));
+        let mut heat =
+            Heaters { hotend: (hot.max(21.0), hot), bed: (bed.max(21.0), bed), at: Instant::now() };
+        let born = Instant::now();
         let say = |port: &mut TTYPort, text: &str| {
             let _ = port.write_all(format!("{text}\n").as_bytes());
         };
@@ -185,6 +235,14 @@ pub fn spawn(mut port: TTYPort, mut script: Script) -> Sim {
                 Ok(n) => rx.extend_from_slice(&buf[..n]),
                 Err(e) if e.kind() == std::io::ErrorKind::TimedOut => {}
                 Err(_) => std::thread::sleep(Duration::from_millis(20)),
+            }
+            if let Some((after, text)) = &script.fault_after
+                && !halted
+                && born.elapsed() >= *after
+            {
+                say(&mut port, &format!("Error:{text}"));
+                halted = true;
+                sd.lock().unwrap().open = None;
             }
             heat.tick(script.heat_rate);
             let rate = if script.sd_lines_per_s > 0.0 { script.sd_lines_per_s } else { 2000.0 };

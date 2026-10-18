@@ -191,6 +191,31 @@ fn the_print_carries_on_without_printfarm_and_is_picked_up_again() {
 }
 
 #[test]
+fn reopening_learns_the_progress_before_the_setup_commands() {
+    let (b, host) = bench(Script { sd_lines_per_s: 100.0, ..Default::default() });
+    let (mut m, _) = ready(Box::new(host), None);
+    let j = job(10, "quick-look", &part(1500));
+    m.start(j.clone()).unwrap();
+    let mut ev = Vec::new();
+    until(&mut m, &mut ev, "the copy", |_, ev| on_printer(ev));
+    until(&mut m, &mut ev, "the print to start", |m, _| {
+        m.status().progress.as_ref().is_some_and(|p| p.done > 0)
+    });
+    drop(m);
+    b.sim.seen.lock().unwrap().commands.clear();
+
+    let mut m = Marlin::attached(reopen(&b));
+    m.adopt(j, SystemTime::now(), true);
+    let mut ev = Vec::new();
+    until(&mut m, &mut ev, "the progress", |m, _| {
+        m.status().progress.as_ref().is_some_and(|p| p.done > 0)
+    });
+    let seen = b.sim.seen.lock().unwrap().commands.clone();
+    assert!(!seen.iter().any(|c| c.starts_with("M155")), "{seen:?}");
+    assert_eq!(b.sim.seen.lock().unwrap().resends, 0);
+}
+
+#[test]
 fn a_job_that_finished_while_away_is_reported_done() {
     let (b, host) = bench(Script { sd_lines_per_s: 5000.0, ..Default::default() });
     let (mut m, _) = ready(Box::new(host), None);

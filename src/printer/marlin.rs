@@ -11,6 +11,8 @@ use std::time::{Duration, Instant, SystemTime};
 
 const READ_TIMEOUT: Duration = Duration::from_millis(20);
 const PROBE_EVERY: Duration = Duration::from_secs(2);
+const PROBE_BUSY: Duration = Duration::from_secs(10);
+const PROBE: [&str; 3] = ["M115", "M27 C", "M27"];
 const PROBE_TRIES: u32 = 4;
 const POLL_EVERY: Duration = Duration::from_secs(2);
 const SD_POLL_BUSY: Duration = Duration::from_secs(3);
@@ -92,6 +94,9 @@ pub struct Marlin {
     sd_cap: Option<bool>,
     sd_file: Option<Option<String>>,
     away: bool,
+    unanswered_probes: u32,
+    stale_oks: u32,
+    identified: bool,
     cleanup: Vec<String>,
     last_rx: Instant,
     attached_at: Instant,
@@ -128,6 +133,9 @@ impl Marlin {
             sd_cap: None,
             sd_file: None,
             away: false,
+            unanswered_probes: 0,
+            stale_oks: 0,
+            identified: false,
             cleanup: Vec::new(),
             last_rx: now,
             attached_at: now,
@@ -163,6 +171,9 @@ impl Marlin {
         self.autoreport = false;
         self.sd_cap = None;
         self.sd_file = None;
+        self.unanswered_probes = 0;
+        self.stale_oks = 0;
+        self.identified = false;
         self.last_rx = now;
         self.attached_at = now;
         self.last_poll = now;
@@ -336,6 +347,7 @@ impl Marlin {
         let text = line.trim_start_matches("echo:");
         if !matches!(self.handshake, Handshake::Ready) {
             if line.contains("FIRMWARE_NAME:") {
+                self.identified = true;
                 self.status.firmware = field(line, "FIRMWARE_NAME");
                 self.status.machine = field(line, "MACHINE_TYPE");
             } else if line.starts_with("Cap:AUTOREPORT_TEMP:1") {
@@ -353,6 +365,10 @@ impl Marlin {
                 self.fault(line.trim_start_matches("Error:").trim().to_string(), events);
             }
         } else if line.contains("FIRMWARE_NAME:") {
+            if self.unanswered_probes > 0 {
+                self.unanswered_probes -= 1;
+                self.stale_oks += PROBE.len() as u32;
+            }
             self.status.firmware = field(line, "FIRMWARE_NAME");
             self.status.machine = field(line, "MACHINE_TYPE");
         } else if self.status.leveling.read_state(line) {
@@ -500,10 +516,17 @@ impl Marlin {
 
     fn ack(&mut self, events: &mut Vec<Event>) {
         if let Handshake::Probing { .. } = self.handshake {
-            self.ready(events);
+            if self.identified {
+                self.ready(events);
+            }
             return;
         }
         let was = self.in_flight.take();
+        if self.stale_oks > 0 {
+            self.stale_oks -= 1;
+            self.in_flight = was;
+            return;
+        }
         if let Some(from) = self.resend_from.take() {
             self.resend = self.sent.iter().filter(|(n, _, _)| *n >= from).cloned().collect();
             if self.resend.is_empty() && from != self.next_n {
@@ -516,6 +539,9 @@ impl Marlin {
         }
         if was == Some(Kind::Manual) {
             self.status.activity = None;
+        }
+        if was == Some(Kind::Setup) {
+            self.unanswered_probes = 0;
         }
         match was {
             Some(Kind::Open) => {
@@ -534,6 +560,10 @@ impl Marlin {
     }
 
     fn ready(&mut self, events: &mut Vec<Event>) {
+        if let Handshake::Probing { tries, .. } = self.handshake {
+            self.unanswered_probes = tries.saturating_sub(1);
+        }
+        self.stale_oks = PROBE.len() as u32 - 1;
         self.handshake = Handshake::Ready;
         self.status.detail.clear();
         self.next_n = 0;
@@ -549,7 +579,6 @@ impl Marlin {
         }
         self.manual.push_back(Queued::Plain("M420 V".into()));
         if self.sd_cap != Some(false) {
-            self.polls.extend(["M27 C", "M27"]);
             if self.job.is_none() {
                 self.polls.push_back("M20");
             }
@@ -730,6 +759,7 @@ impl Marlin {
         let Handshake::Probing { last, tries } = self.handshake else { return };
         let due = match last {
             None => self.attached_at.elapsed() > Duration::from_millis(500),
+            Some(at) if self.last_rx > at => at.elapsed() > PROBE_BUSY,
             Some(at) => at.elapsed() > PROBE_EVERY,
         };
         if !due {
@@ -743,7 +773,7 @@ impl Marlin {
             self.retry_at = Instant::now() + GIVE_UP_RETRY;
             return;
         }
-        if self.write("M115", events) {
+        if self.write(&PROBE.join("\n"), events) {
             self.handshake = Handshake::Probing { last: Some(Instant::now()), tries: tries + 1 };
         }
     }

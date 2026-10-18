@@ -14,8 +14,16 @@ struct Cli {
 #[derive(Subcommand)]
 enum Command {
     Ports,
-    Probe { port: String },
-    Info { file: PathBuf },
+    Probe {
+        port: String,
+    },
+    Info {
+        file: PathBuf,
+    },
+    Demo {
+        #[arg(long, default_value_t = 12)]
+        printers: usize,
+    },
 }
 
 fn main() -> ExitCode {
@@ -33,6 +41,13 @@ fn main() -> ExitCode {
             println!("firmware  {}", d.firmware.unwrap_or_else(|| "-".into()));
             println!("machine   {}", d.machine.unwrap_or_else(|| "-".into()));
         }),
+        Some(Command::Demo { printers }) => {
+            #[cfg(unix)]
+            let r = printfarm::demo::run(printers);
+            #[cfg(not(unix))]
+            let r = Err(format!("the demo farm needs a Unix system ({printers} printers)"));
+            r
+        }
         Some(Command::Info { file }) => {
             printfarm::gcode::scan(&file).map_err(|e| format!("{}: {e}", file.display())).map(|m| {
                 println!("commands  {}", m.commands);

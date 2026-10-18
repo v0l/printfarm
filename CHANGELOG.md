@@ -7,6 +7,8 @@ All notable changes to printfarm are listed here. The format follows
 ## [Unreleased]
 
 ### Changed
+- Printers are one row each: state, job, progress, time left and the control that fits. "details"
+  expands a printer to its full card and "hide" folds it back. A count by state sits above the list.
 - A job is copied to the printer's SD card and printed from there, so the printer carries on when
   printfarm closes. On opening, printfarm asks the printer whether its job is still running,
   finished while it was away, or whether it is printing something else.
@@ -15,6 +17,16 @@ All notable changes to printfarm are listed here. The format follows
 - Temperatures are drawn over their sparklines, with the text kept above the line.
 
 ### Added
+- Queued jobs show a picture of the part. G-code without a slicer thumbnail is drawn from its
+  moves when it is added, in the background, and kept in `thumbs/` so it is drawn only once.
+- A 3D preview of the print, built from the G-code moves as rounded plastic beads and drawn with
+  egui_bench's `viewer3d`: turn it, zoom, scrub through the layers. Opened on a running print it
+  follows the printer, drawing what is printed and the bead being printed now in orange. printfarm
+  now renders with wgpu instead of glow.
+- Every printer has a short id (`P01`) shown on its row and card, in the queue, notices and
+  history. It is filled in for existing printers and can be edited.
+- `printfarm demo` opens a window of simulated printers in different states, including faults, to
+  work on the interface without hardware.
 - On Linux, a mounted USB stick or SD card shows a bar with "copy queue" and "eject". Copying lets
   you pick which jobs go, checks the free space, writes 8.3 names the printer can open, skips files
   already on the card and never overwrites a different file. The jobs stay queued, marked on card,
