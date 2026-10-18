@@ -6,6 +6,8 @@ All notable changes to printfarm are listed here. The format follows
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-10-18
+
 ### Changed
 - Printers are one row each: state, job, progress, time left and the control that fits. "details"
   expands a printer to its full card and "hide" folds it back. A count by state sits above the list.
@@ -44,6 +46,9 @@ All notable changes to printfarm are listed here. The format follows
   the mesh saved to the printer.
 
 ### Fixed
+- On reopening, the progress of a print already running shows in about 4 s instead of 14 s.
+- The preview no longer zigzags across infill lines or cuts across gyroid waves in big files, and
+  leaves out the purge line printed before the first layer.
 - Heaters are restored after probing.
 - The heating label no longer flickers.
 
