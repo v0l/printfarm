@@ -2362,7 +2362,7 @@ impl eframe::App for App {
                     ui.horizontal(|ui| {
                         status(ui, ok, &text);
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            if ui.add(Key::new("x").outline(VALUE)).clicked() {
+                            if ui.add(Key::new("dismiss").outline(VALUE)).clicked() {
                                 self.notice = None;
                             }
                         });
