@@ -1058,11 +1058,21 @@ impl App {
                         .on_hover_text("the filament loaded, click to change");
                     egui::Popup::menu(&r).width(160.0).show(|ui| {
                         for f in FILAMENTS {
-                            if ui.button(action(f)).clicked() {
+                            if ui
+                                .add(Key::new(f).outline(VALUE).min_width(ui.available_width()))
+                                .clicked()
+                            {
                                 filament_pick.set(Some(Some(f.to_string())));
                             }
                         }
-                        if ui.button(action("Any filament")).clicked() {
+                        if ui
+                            .add(
+                                Key::new("Any filament")
+                                    .outline(VALUE)
+                                    .min_width(ui.available_width()),
+                            )
+                            .clicked()
+                        {
                             filament_pick.set(Some(None));
                         }
                     });
@@ -1340,10 +1350,7 @@ impl App {
                         let path = r.path.clone();
                         resp.context_menu(|ui| {
                             if ui
-                                .add_enabled(
-                                    path.exists(),
-                                    egui::Button::new(action("Queue again")),
-                                )
+                                .add(Key::new("Queue again").outline(VALUE).enabled(path.exists()))
                                 .clicked()
                             {
                                 acts.push(Act::Again(i));
@@ -1657,11 +1664,17 @@ impl App {
             .show(ctx, |ui| {
                 let mut send = false;
                 ui.horizontal(|ui| {
-                    let r = field_then(ui, &mut self.console_line, "G-code, such as M503", 80.0, |ui| {
-                        if ui.add(Key::new("send").outline(READOUT)).clicked() {
-                            send = true;
-                        }
-                    });
+                    let r = field_then(
+                        ui,
+                        &mut self.console_line,
+                        "G-code, such as M503",
+                        80.0,
+                        |ui| {
+                            if ui.add(Key::new("send").outline(READOUT)).clicked() {
+                                send = true;
+                            }
+                        },
+                    );
                     if r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
                         send = true;
                         r.request_focus();
@@ -2349,7 +2362,7 @@ impl eframe::App for App {
                     ui.horizontal(|ui| {
                         status(ui, ok, &text);
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            if ui.small_button("x").clicked() {
+                            if ui.add(Key::new("x").outline(VALUE)).clicked() {
                                 self.notice = None;
                             }
                         });
@@ -2696,11 +2709,21 @@ fn printer_info(ui: &mut Ui, d: &CardData, acts: &mut Vec<Act>) {
         let heat = ui.add(Key::new("heat").outline(VALUE).enabled(online));
         egui::Popup::menu(&heat).width(200.0).show(|ui| {
             for (name, hotend, bed) in PRESETS {
-                if ui.button(action(format!("{name}  {hotend} / {bed} °C"))).clicked() {
+                if ui
+                    .add(
+                        Key::new(format!("{name}  {hotend} / {bed} °C"))
+                            .outline(VALUE)
+                            .min_width(ui.available_width()),
+                    )
+                    .clicked()
+                {
                     acts.push(Act::Gcode(i, format!("M104 S{hotend}\nM140 S{bed}")));
                 }
             }
-            if ui.button(action("Cool down")).clicked() {
+            if ui
+                .add(Key::new("Cool down").outline(VALUE).min_width(ui.available_width()))
+                .clicked()
+            {
                 acts.push(Act::Gcode(i, "M104 S0\nM140 S0".into()));
             }
         });
@@ -2721,16 +2744,42 @@ fn printer_info(ui: &mut Ui, d: &CardData, acts: &mut Vec<Act>) {
         }
         let more = ui.add(Key::more().id_salt(("more", i)));
         egui::Popup::menu(&more).width(200.0).show(|ui| {
-            if ui.button(action("Queue a file for this printer…")).clicked() {
+            if ui
+                .add(
+                    Key::new("Queue a file for this printer…")
+                        .outline(VALUE)
+                        .min_width(ui.available_width()),
+                )
+                .clicked()
+            {
                 acts.push(Act::Pick(Some(config.id.clone())));
             }
-            if ui.add_enabled(!state.busy(), egui::Button::new(action("Edit"))).clicked() {
+            if ui
+                .add(
+                    Key::new("Edit")
+                        .outline(VALUE)
+                        .min_width(ui.available_width())
+                        .enabled(!state.busy()),
+                )
+                .clicked()
+            {
                 acts.push(Act::Edit(Some(i)));
             }
-            if ui.button(action("Reconnect")).clicked() {
+            if ui
+                .add(Key::new("Reconnect").outline(VALUE).min_width(ui.available_width()))
+                .clicked()
+            {
                 acts.push(Act::Reconnect(i));
             }
-            if ui.add_enabled(!state.busy(), egui::Button::new(action("Remove"))).clicked() {
+            if ui
+                .add(
+                    Key::new("Remove")
+                        .outline(FAULT)
+                        .min_width(ui.available_width())
+                        .enabled(!state.busy()),
+                )
+                .clicked()
+            {
                 acts.push(Act::Remove(i));
             }
         });
