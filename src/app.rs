@@ -8,7 +8,7 @@ use crate::removable::{self, Transfer, Volume};
 use crate::station::{Control, Station, Wake};
 use crate::thumbs::Thumbs;
 use crate::toolpath::{self, Built, Mark, Toolpath};
-use egui::{Color32, FontId, Id, Rect, Sense, Stroke, TextureHandle, TextureOptions, Ui, Vec2};
+use egui::{Color32, Id, Rect, Sense, Stroke, TextureHandle, TextureOptions, Ui, Vec2};
 use egui_bench::prelude::*;
 use egui_bench::viewer3d::{Camera as Eye, Orbit, Viewer};
 use std::collections::{HashMap, HashSet};
@@ -1657,19 +1657,14 @@ impl App {
             .show(ctx, |ui| {
                 let mut send = false;
                 ui.horizontal(|ui| {
-                    let w = ui.available_width() - 80.0;
-                    let r = ui.add_sized(
-                        [w, 24.0],
-                        egui::TextEdit::singleline(&mut self.console_line)
-                            .hint_text("G-code, such as M503")
-                            .font(FontId::monospace(13.0)),
-                    );
+                    let r = field_then(ui, &mut self.console_line, "G-code, such as M503", 80.0, |ui| {
+                        if ui.add(Key::new("send").outline(READOUT)).clicked() {
+                            send = true;
+                        }
+                    });
                     if r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
                         send = true;
                         r.request_focus();
-                    }
-                    if ui.add(Key::new("send").outline(READOUT)).clicked() {
-                        send = true;
                     }
                 });
                 if send && !self.console_line.trim().is_empty() {
