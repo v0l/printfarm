@@ -3,7 +3,7 @@ name = "printfarm"
 version = "0.2.0"
 edition = "2024"
 rust-version = "1.92"
-license = "MIT"
+license = "GPL-3.0-or-later"
 description = "One window for every 3D printer: state, temperatures, progress, camera, job queue and history"
 repository = "https://github.com/v0l/printfarm"
 

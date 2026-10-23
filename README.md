@@ -43,4 +43,6 @@ printfarm demo
 [docs/guide.md](docs/guide.md) covers how jobs reach the printer, SD cards, the file manager,
 the bed mesh, the preview, config files, the command line and development.
 
-MIT licensed.
+GPL-3.0-or-later. Copyright © 2026 Kieran Harkin. You may share and change it under the terms of
+the GNU General Public License, version 3 or any later version; see [LICENSE](LICENSE). Releases
+before the next release were published under MIT and stay available under it.
