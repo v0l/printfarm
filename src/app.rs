@@ -514,7 +514,7 @@ impl App {
             let free = removable::free_space(&d.volume.mount).or(d.volume.free);
             let fits = free.is_none_or(|f| f >= need);
             let (mut go, mut cancel) = (false, false);
-            let m = egui::Modal::new(Id::new("copy queue")).show(ctx, |ui| {
+            let m = egui::Modal::new(Id::unique("copy queue")).show(ctx, |ui| {
                 ui.set_width(460.0);
                 modal_title(ui, &format!("Copy the queue to {}", d.volume.label));
                 egui::ScrollArea::vertical().max_height(260.0).show(ui, |ui| {
@@ -568,7 +568,7 @@ impl App {
             let (done, total, file) = c.transfer.progress();
             let label = c.volume.label.clone();
             let mut stop = false;
-            egui::Modal::new(Id::new("copying")).show(ctx, |ui| {
+            egui::Modal::new(Id::unique("copying")).show(ctx, |ui| {
                 ui.set_width(420.0);
                 modal_title(ui, &format!("Copying to {label}"));
                 progress(ui, "file", done as f32, Some(total as f32), &file);
@@ -1385,7 +1385,7 @@ impl App {
         }
         let mut save = false;
         let mut close = false;
-        let modal = egui::Modal::new(Id::new("printer editor")).show(ctx, |ui| {
+        let modal = egui::Modal::new(Id::unique("printer editor")).show(ctx, |ui| {
             ui.set_width(460.0);
             modal_title(ui, if ed.index.is_some() { "Edit printer" } else { "Add a printer" });
             row(ui, "name", |ui| {
@@ -1493,7 +1493,7 @@ impl App {
         if let Some(i) = self.removing {
             let name = self.config.printers[i].title();
             let mut done = false;
-            let m = egui::Modal::new(Id::new("remove")).show(ctx, |ui| {
+            let m = egui::Modal::new(Id::unique("remove")).show(ctx, |ui| {
                 ui.set_width(380.0);
                 modal_title(ui, &format!("Remove {name}?"));
                 note(ui, "Its queued jobs go back to any printer. History is kept.", LEGEND);
@@ -1528,7 +1528,7 @@ impl App {
             let progress = self.stations[i].status().progress;
             let sending = progress.as_ref().is_some_and(|p| p.sending);
             let job = progress.map(|p| p.job.name).unwrap_or_default();
-            let m = egui::Modal::new(Id::new("cancel")).show(ctx, |ui| {
+            let m = egui::Modal::new(Id::unique("cancel")).show(ctx, |ui| {
                 ui.set_width(380.0);
                 modal_title(ui, &format!("Cancel {job}?"));
                 let said = if sending {
@@ -1557,7 +1557,7 @@ impl App {
             let name = self.config.printers[i].title();
             let mut pick = heat;
             let mut go = false;
-            let m = egui::Modal::new(Id::new("probe")).show(ctx, |ui| {
+            let m = egui::Modal::new(Id::unique("probe")).show(ctx, |ui| {
                 ui.set_width(400.0);
                 modal_title(ui, &format!("Probe the bed on {name}?"));
                 note(
@@ -1597,7 +1597,7 @@ impl App {
         }
         if let Some(i) = self.saving_mesh {
             let name = self.config.printers[i].title();
-            let m = egui::Modal::new(Id::new("save mesh")).show(ctx, |ui| {
+            let m = egui::Modal::new(Id::unique("save mesh")).show(ctx, |ui| {
                 ui.set_width(400.0);
                 modal_title(ui, &format!("Save the mesh on {name}?"));
                 note(
@@ -1621,7 +1621,7 @@ impl App {
         }
         if self.closing {
             let sending = self.sending();
-            let m = egui::Modal::new(Id::new("closing")).show(ctx, |ui| {
+            let m = egui::Modal::new(Id::unique("closing")).show(ctx, |ui| {
                 ui.set_width(400.0);
                 modal_title(ui, "Still sending to a printer");
                 note(
@@ -1658,7 +1658,7 @@ impl App {
         let mut open = true;
         let shared = self.stations[i].shared.clone();
         egui::Window::new(format!("{} console", self.config.printers[i].title()))
-            .id(Id::new(("console", &id)))
+            .id(Id::unique(("console", &id)))
             .open(&mut open)
             .default_size([560.0, 380.0])
             .show(ctx, |ui| {
@@ -1736,7 +1736,7 @@ impl App {
         let mut open = true;
         let title = format!("{} preview", pv.name);
         egui::Window::new(title)
-            .id(Id::new("preview window"))
+            .id(Id::unique("preview window"))
             .open(&mut open)
             .default_size([760.0, 720.0])
             .min_size([420.0, 380.0])
@@ -1900,7 +1900,7 @@ impl App {
         let mut refresh = false;
         let mut print: Option<String> = None;
         egui::Window::new(title)
-            .id(Id::new("files window"))
+            .id(Id::unique("files window"))
             .open(&mut open)
             .default_size([860.0, 480.0])
             .show(ctx, |ui| {
@@ -2117,7 +2117,7 @@ impl App {
                 Delete::Card(n) | Delete::Stick(_, n) => n.clone(),
             };
             let (mut yes, mut no) = (false, false);
-            let m = egui::Modal::new(Id::new("delete file")).show(ctx, |ui| {
+            let m = egui::Modal::new(Id::unique("delete file")).show(ctx, |ui| {
                 ui.set_width(380.0);
                 modal_title(ui, &format!("Delete {name}?"));
                 let said = match what {
@@ -2176,7 +2176,7 @@ impl App {
         let unclear = self.queue.unclear.contains(&id);
         let mut open = true;
         egui::Window::new(format!("{} bed", self.config.printers[i].title()))
-            .id(Id::new(("mesh", &id)))
+            .id(Id::unique(("mesh", &id)))
             .open(&mut open)
             .default_width(460.0)
             .resizable(false)
@@ -2275,7 +2275,7 @@ impl App {
         };
         let mut open = true;
         egui::Window::new(format!("{} camera", self.printer_name(&id)))
-            .id(Id::new(("camera", &id)))
+            .id(Id::unique(("camera", &id)))
             .open(&mut open)
             .default_size([size.x.min(960.0), size.y.min(720.0)])
             .show(ctx, |ui| {
@@ -2301,7 +2301,7 @@ impl App {
             }
         }
         let dropped: Vec<PathBuf> =
-            ctx.input(|i| i.raw.dropped_files.iter().filter_map(|f| f.path.clone()).collect());
+            ctx.input(|i| i.raw.dropped_files.iter().map(|f| f.path().to_path_buf()).collect());
         for p in dropped {
             self.enqueue(&p, None);
         }
