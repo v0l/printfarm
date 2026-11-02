@@ -2356,18 +2356,10 @@ impl eframe::App for App {
                 .show(ui, |ui| self.media_bar(ui));
         }
         if let Some((ok, text)) = self.notice.clone() {
-            egui::Panel::bottom("notice")
-                .frame(egui::Frame::NONE.fill(CHASSIS).inner_margin(egui::Margin::symmetric(12, 4)))
-                .show(ui, |ui| {
-                    ui.horizontal(|ui| {
-                        status(ui, ok, &text);
-                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            if ui.add(Key::new("dismiss").outline(VALUE)).clicked() {
-                                self.notice = None;
-                            }
-                        });
-                    });
-                });
+            let tone = if ok { Tone::Ok } else { Tone::Fault };
+            if egui_bench::toast::toast(&ctx, "notice", &text, tone) {
+                self.notice = None;
+            }
         }
         egui::CentralPanel::no_frame().show(ui, |ui| {
             let r = ui.max_rect();
