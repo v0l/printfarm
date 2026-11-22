@@ -101,6 +101,16 @@ jobs:
     if: startsWith(github.ref, 'refs/tags/')
     steps:
       - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - name: Source archive
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          mkdir -p dist
+          name=printfarm-${TAG}-source.tar.gz
+          git ls-files --recurse-submodules -z | tar --null -T - --transform "s,^,printfarm-${TAG}/," -czf "dist/$name"
+          (cd dist && sha256sum "$name" > "$name.sha256")
       - name: Release notes
         env:
           TAG: ${{ github.ref_name }}
