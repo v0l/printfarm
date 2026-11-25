@@ -6,8 +6,11 @@ All notable changes to printfarm are listed here. The format follows
 
 ## [Unreleased]
 
+## [0.2.3] - 2026-11-25
+
 ### Changed
 - The notification at the bottom of the window is now a toast with a fixed width range, and its dismiss button no longer wraps.
+- Every release now includes a source archive with its checksum.
 
 ## [0.2.2] - 2026-11-01
 
